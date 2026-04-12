@@ -1,0 +1,7 @@
+backend/venv/
+backend/.venv/
+backend/dataset/
+node_modules/
+*.db
+*.pkl
+__pycache__/

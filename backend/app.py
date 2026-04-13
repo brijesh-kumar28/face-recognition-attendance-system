@@ -8,6 +8,7 @@ import hashlib
 import jwt
 import base64
 import numpy as np
+import secrets
 from datetime import datetime, timedelta
 from functools import wraps
 import shutil
@@ -23,8 +24,9 @@ CORS(
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
 
-DATABASE = "attendance.db"
-DATASET_PATH = "dataset"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE = os.path.join(BASE_DIR, "attendance.db")
+DATASET_PATH = os.path.join(BASE_DIR, "dataset")
 
 
 # ================= HELPERS =================
@@ -37,6 +39,10 @@ def connect_db():
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
+
+
+def hash_reset_token(token):
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 def generate_token(user_id, role):
@@ -112,6 +118,32 @@ def _get_attendance_schema(conn):
         "user_col": user_col,
         "has_status": has_status,
     }
+
+
+def ensure_password_reset_table():
+    """Create password reset token table if it does not exist."""
+    conn = connect_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at INTEGER NOT NULL,
+            used_at INTEGER,
+            created_at INTEGER DEFAULT (strftime('%s','now')),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id ON password_reset_tokens(user_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)"
+    )
+    conn.commit()
+    conn.close()
 
 
 def _extract_face_crops(frame):
@@ -233,6 +265,9 @@ def _mark_attendance_for_user(user_id, user_name, conn):
         conn.commit()
         return {"name": user_name, "action": "check_in", "time": time_now, "status": status}
 
+
+    ensure_password_reset_table()
+
 # =============================================
 #              AUTH ENDPOINTS
 # =============================================
@@ -261,6 +296,116 @@ def login():
 def register():
     """Legacy public registration - now redirects to admin-only flow."""
     return jsonify({"error": "Registration is disabled. Please contact your admin."}), 403
+
+
+@app.route("/api/auth/forgot-password", methods=["POST"])
+def forgot_password():
+    """Create a one-time password reset token for a known email."""
+    data = request.json or {}
+    email = (data.get("email") or "").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    conn = connect_db()
+    now_ts = int(datetime.utcnow().timestamp())
+    conn.execute(
+        "DELETE FROM password_reset_tokens WHERE expires_at < ? OR used_at IS NOT NULL",
+        (now_ts,),
+    )
+
+    user = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+    raw_token = None
+
+    if user:
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hash_reset_token(raw_token)
+        expires_at = int((datetime.utcnow() + timedelta(minutes=30)).timestamp())
+
+        conn.execute(
+            "DELETE FROM password_reset_tokens WHERE user_id=?",
+            (user["id"],),
+        )
+        conn.execute(
+            "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+            (user["id"], token_hash, expires_at),
+        )
+
+    conn.commit()
+    conn.close()
+
+    response = {
+        "message": "If an account with that email exists, a reset request has been created."
+    }
+
+    # Development fallback: return token when running in debug/local mode.
+    if raw_token and app.debug:
+        response["resetToken"] = raw_token
+        response["expiresInMinutes"] = 30
+
+    return jsonify(response)
+
+
+@app.route("/api/auth/reset-password", methods=["POST"])
+def reset_password():
+    """Reset user password with a valid, unexpired one-time token."""
+    data = request.json or {}
+    token = (data.get("token") or "").strip()
+    new_password = data.get("newPassword") or ""
+
+    if not token or not new_password:
+        return jsonify({"error": "Token and newPassword are required"}), 400
+
+    if len(new_password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+
+    token_hash = hash_reset_token(token)
+    now_ts = int(datetime.utcnow().timestamp())
+
+    conn = connect_db()
+    reset_row = conn.execute(
+        """
+        SELECT id, user_id, expires_at, used_at
+        FROM password_reset_tokens
+        WHERE token_hash=?
+        LIMIT 1
+        """,
+        (token_hash,),
+    ).fetchone()
+
+    if not reset_row:
+        conn.close()
+        return jsonify({"error": "Invalid or expired reset token"}), 400
+
+    if reset_row["used_at"] is not None:
+        conn.close()
+        return jsonify({"error": "Reset token already used"}), 400
+
+    if int(reset_row["expires_at"]) < now_ts:
+        conn.execute(
+            "UPDATE password_reset_tokens SET used_at=? WHERE id=?",
+            (now_ts, reset_row["id"]),
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"error": "Reset token expired"}), 400
+
+    conn.execute(
+        "UPDATE users SET password_hash=? WHERE id=?",
+        (hash_password(new_password), reset_row["user_id"]),
+    )
+    conn.execute(
+        "UPDATE password_reset_tokens SET used_at=? WHERE id=?",
+        (now_ts, reset_row["id"]),
+    )
+    conn.execute(
+        "DELETE FROM password_reset_tokens WHERE user_id=? AND id<>?",
+        (reset_row["user_id"], reset_row["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({"message": "Password reset successful. Please sign in with your new password."})
 
 
 @app.route("/api/auth/me", methods=["GET"])

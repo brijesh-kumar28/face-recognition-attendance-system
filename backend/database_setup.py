@@ -2,7 +2,8 @@ import sqlite3
 import hashlib
 import os
 
-DATABASE = "attendance.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE = os.path.join(BASE_DIR, "attendance.db")
 
 conn = sqlite3.connect(DATABASE)
 cursor = conn.cursor()
@@ -34,6 +35,26 @@ CREATE TABLE IF NOT EXISTS attendance (
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 )
 """)
+
+# ================= PASSWORD RESET TOKENS TABLE =================
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at INTEGER NOT NULL,
+    used_at INTEGER,
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+)
+""")
+
+cursor.execute(
+    "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id ON password_reset_tokens(user_id)"
+)
+cursor.execute(
+    "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)"
+)
 
 # ================= MIGRATE: old employees table =================
 # Check if old employees table exists and migrate data

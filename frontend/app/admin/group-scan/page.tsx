@@ -81,13 +81,22 @@ export default function AdminGroupScanPage() {
 
     const canvas = canvasRef.current;
     const video = videoRef.current;
-    const width = video.videoWidth || 1280;
-    const height = video.videoHeight || 720;
+    let width = video.videoWidth || 1280;
+    let height = video.videoHeight || 720;
 
     if (width === 0 || height === 0) {
       setError("Camera frame not ready. Please wait a moment and try again.");
       setScanning(false);
       return;
+    }
+
+    // PERF: Optimize canvas size for faster processing
+    const maxWidth = 800;
+    const maxHeight = 600;
+    if (width > maxWidth || height > maxHeight) {
+      const ratio = Math.min(maxWidth / width, maxHeight / height);
+      width = Math.round(width * ratio);
+      height = Math.round(height * ratio);
     }
 
     canvas.width = width;
@@ -100,7 +109,8 @@ export default function AdminGroupScanPage() {
     }
 
     ctx.drawImage(video, 0, 0, width, height);
-    const imageData = canvas.toDataURL("image/jpeg", 0.9);
+    // PERF: Use 0.75 quality for faster transmission while maintaining face detection accuracy
+    const imageData = canvas.toDataURL("image/jpeg", 0.75);
 
     if (!imageData || imageData.length < 100) {
       setError("Unable to capture image. Please try again.");

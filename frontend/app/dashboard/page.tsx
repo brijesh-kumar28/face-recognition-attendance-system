@@ -101,13 +101,27 @@ export default function UserDashboard() {
     const canvas = canvasRef.current;
     const video = videoRef.current;
 
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+    // PERF: Optimize image size for faster transmission and processing
+    const maxWidth = 640;
+    const maxHeight = 480;
+    let width = video.videoWidth;
+    let height = video.videoHeight;
+    
+    // Scale down if larger than max dimensions
+    if (width > maxWidth || height > maxHeight) {
+      const ratio = Math.min(maxWidth / width, maxHeight / height);
+      width = Math.round(width * ratio);
+      height = Math.round(height * ratio);
+    }
+
+    canvas.width = width;
+    canvas.height = height;
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
 
-    ctx.drawImage(video, 0, 0);
-    return canvas.toDataURL("image/jpeg");
+    ctx.drawImage(video, 0, 0, width, height);
+    // PERF: Use 0.75 quality for faster transmission while maintaining face detection accuracy
+    return canvas.toDataURL("image/jpeg", 0.75);
   };
 
   const handleMarkAttendance = async () => {

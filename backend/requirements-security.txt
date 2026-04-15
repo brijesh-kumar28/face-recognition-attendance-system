@@ -1,0 +1,23 @@
+# ============ SECURITY UPDATES ============
+# New packages required for production security hardening
+
+# Password hashing (replaces SHA256)
+bcrypt==4.1.2
+
+# Rate limiting for DDoS protection
+Flask-Limiter==3.5.0
+
+# MIME type validation for file uploads
+python-magic==0.4.27
+
+# Note: For Windows, use python-magic-bin instead of python-magic
+# Uncomment the line below if on Windows:
+# python-magic-bin==0.4.14
+
+# Existing dependencies (ensure these versions)
+Flask==3.0.0
+flask-cors==4.0.0
+PyJWT==2.8.1
+numpy==1.24.3
+opencv-python==4.8.1.78
+deepface==0.0.92

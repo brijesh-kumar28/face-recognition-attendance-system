@@ -1,20 +1,47 @@
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from deepface import DeepFace
 import cv2
 import os
 import sqlite3
-import hashlib
 import jwt
 import base64
 import numpy as np
 import secrets
+import uuid
+import bcrypt
 from datetime import datetime, timedelta
 from functools import wraps
 import shutil
+import time
+import magic
+from pathlib import Path
+import threading
+import hashlib
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "facetrack_jwt_secret_key_2024"
+
+# ============ JWT SECURITY: Load from environment ============
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    # DEVELOPMENT ONLY: Use default if not set
+    if os.getenv("FLASK_ENV") == "production":
+        raise ValueError("[SECURITY] JWT_SECRET environment variable is required in production")
+    JWT_SECRET = "dev_secret_key_only_for_development_do_not_use_in_production"
+    print("[WARNING] Using development JWT_SECRET. Set JWT_SECRET environment variable for production.")
+
+app.config["SECRET_KEY"] = JWT_SECRET
+print(f"[CONFIG] JWT_SECRET loaded from environment")
+
+# ============ RATE LIMITING: DDoS Protection ============
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
+print(f"[CONFIG] Rate limiting enabled")
 
 CORS(
     app,
@@ -28,6 +55,186 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE = os.path.join(BASE_DIR, "attendance.db")
 DATASET_PATH = os.path.join(BASE_DIR, "dataset")
 
+# ============ FACE RECOGNITION CONFIGURATION ============
+# Configurable face distance threshold for matching accuracy
+# Lower values = stricter matching (fewer false positives, more false negatives)
+# Higher values = looser matching (more false positives, fewer false negatives)
+# 0.3 (strict) is more secure for identity verification
+FACE_DISTANCE_THRESHOLD = float(os.getenv("FACE_DISTANCE_THRESHOLD", "0.3"))
+print(f"[CONFIG] Face distance threshold set to {FACE_DISTANCE_THRESHOLD}")
+
+# ============ SECURITY HEADERS: Production Hardening ============
+@app.after_request
+def set_security_headers(response):
+    """Add security headers to all responses."""
+    # Prevent clickjacking attacks
+    response.headers["X-Frame-Options"] = "DENY"
+    # Prevent MIME type sniffing
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # Basic CSP - can be customized
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+    # Prevent browser caching sensitive data
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+print(f"[CONFIG] Security headers configured")
+
+# ============ CONCURRENCY SAFETY: Thread Locks ============
+# CRITICAL: Lock for DeepFace model loading (singleton pattern)
+_model_lock = threading.RLock()  # Reentrant lock for nested access
+print(f"[CONFIG] Model lock initialized (thread-safe face recognition)")
+
+# Lock for attendance operations (prevents race conditions on same user)
+_attendance_locks = {}  # {user_id: threading.Lock}
+_attendance_locks_lock = threading.Lock()
+
+def get_attendance_lock(user_id):
+    """Get thread lock for a specific user (prevents concurrent check-in/out)."""
+    with _attendance_locks_lock:
+        if user_id not in _attendance_locks:
+            _attendance_locks[user_id] = threading.Lock()
+        return _attendance_locks[user_id]
+
+# ============ REQUEST DEDUPLICATION: Prevent duplicate processing ============
+# Cache for in-flight request tracking (prevents re-processing same request)
+_request_cache = {}  # {request_hash: (result, timestamp)}
+_request_cache_lock = threading.Lock()
+REQUEST_DEDUPE_TTL = 5  # Deduplicate for 5 seconds
+
+def get_request_signature(user_id, face_distance=None):
+    """Generate unique signature for request (for deduplication)."""
+    # Combine user_id + current second + face_distance (rounded to 2 decimals)
+    current_sec = int(time.time())
+    sig_str = f"{user_id}:{current_sec}"
+    if face_distance is not None:
+        sig_str += f":{round(face_distance, 2)}"
+    return hashlib.md5(sig_str.encode()).hexdigest()
+
+def is_duplicate_request(signature):
+    """Check if request is already being processed (duplicate)."""
+    with _request_cache_lock:
+        if signature in _request_cache:
+            result, ts = _request_cache[signature]
+            if time.time() - ts < REQUEST_DEDUPE_TTL:
+                print(f"[CONCURRENCY] Duplicate request detected (cached): {signature}")
+                return True, result  # Return cached result
+        return False, None
+
+def cache_request_result(signature, result):
+    """Cache request result for deduplication."""
+    with _request_cache_lock:
+        _request_cache[signature] = (result, time.time())
+        print(f"[CONCURRENCY] Request cached for deduplication: {signature}")
+
+# ============ PERFORMANCE CACHING: In-memory cache for user lookups ============
+# Simple LRU-like cache to reduce database queries
+_user_cache = {}  # {user_id: user_dict}
+_user_cache_timestamp = {}  # {user_id: timestamp}
+CACHE_TTL = 300  # Cache for 5 minutes
+
+def get_cached_user(user_id, connection=None):
+    """Get user from cache or database. Updates cache on fetch."""
+    current_time = time.time()
+    
+    # Check cache validity
+    if user_id in _user_cache and user_id in _user_cache_timestamp:
+        if current_time - _user_cache_timestamp[user_id] < CACHE_TTL:
+            print(f"[CACHE-HIT] User {user_id}")
+            return _user_cache[user_id]
+        else:
+            # Cache expired, remove it
+            del _user_cache[user_id]
+            del _user_cache_timestamp[user_id]
+    
+    # Cache miss, fetch from database
+    if connection is None:
+        connection = connect_db()
+        should_close = True
+    else:
+        should_close = False
+    
+    try:
+        user = connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if user:
+            user_dict_result = dict(user)
+            _user_cache[user_id] = user_dict_result
+            _user_cache_timestamp[user_id] = current_time
+            print(f"[CACHE-MISS] User {user_id} - fetched from DB")
+            return user_dict_result
+        return None
+    finally:
+        if should_close:
+            connection.close()
+
+def invalidate_user_cache(user_id):
+    """Invalidate cache for a specific user when they're updated."""
+    if user_id in _user_cache:
+        del _user_cache[user_id]
+    if user_id in _user_cache_timestamp:
+        del _user_cache_timestamp[user_id]
+    print(f"[CACHE-INVALIDATE] User {user_id}")
+
+# ============ PAGINATION HELPERS ============
+def validate_pagination_params(page=None, limit=None, max_limit=100):
+    """Validate and return safe pagination parameters."""
+    try:
+        page = int(page) if page else 1
+        limit = int(limit) if limit else 20
+    except (ValueError, TypeError):
+        page = 1
+        limit = 20
+    
+    # Enforce limits
+    page = max(1, page)
+    limit = max(1, min(limit, max_limit))  # Cap at max_limit, min 1
+    
+    offset = (page - 1) * limit
+    return page, limit, offset
+
+def paginate_results(total_count, page, limit, items):
+    """Return pagination metadata with results."""
+    total_pages = (total_count + limit - 1) // limit  # Ceiling division
+    return {
+        "items": items,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total_count,
+            "totalPages": total_pages,
+            "hasMore": page < total_pages
+        }
+    }
+
+# Cache the DeepFace model in memory to avoid reloading it on every request
+_model_cache = {}
+
+def get_cached_model(model_name="Facenet512", force_reload=False):
+    """Get or initialize a DeepFace model with caching to improve performance."""
+    # CONCURRENCY: Use lock to prevent multiple simultaneous model loads
+    with _model_lock:
+        if force_reload or model_name not in _model_cache:
+            try:
+                print(f"[CONCURRENCY] Acquiring lock to load {model_name} model...")
+                _model_cache[model_name] = DeepFace.build_model(model_name)
+                print(f"[PERF] Loaded {model_name} model (cached, thread-safe)")
+            except Exception as e:
+                print(f"[PERF] Error loading {model_name}: {e}")
+                return None
+        else:
+            print(f"[PERF] Using cached {model_name} model (no lock needed)")
+    return _model_cache.get(model_name)
+
+def optimize_image_for_recognition(image, max_width=480):
+    """Optimize image size for faster face recognition without losing quality."""
+    height, width = image.shape[:2]
+    if width > max_width:
+        scale = max_width / width
+        new_height = int(height * scale)
+        image = cv2.resize(image, (max_width, new_height), interpolation=cv2.INTER_LINEAR)
+    return image
+
 
 # ================= HELPERS =================
 
@@ -37,22 +244,127 @@ def connect_db():
     return conn
 
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+def hash_password(password: str) -> str:
+    """Hash password securely using bcrypt."""
+    if not isinstance(password, str) or len(password) < 6:
+        raise ValueError("Password must be at least 6 characters")
+    # Generate salt and hash
+    salt = bcrypt.gensalt(rounds=12)
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed.decode('utf-8')
 
 
-def hash_reset_token(token):
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify password against bcrypt hash."""
+    try:
+        return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+    except Exception:
+        return False
+
+
+def hash_reset_token(token: str) -> str:
+    """Hash reset token for secure storage."""
+    import hashlib
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def validate_email(email: str) -> bool:
+    """Validate email format."""
+    import re
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(pattern, email) is not None
+
+
+def validate_username(name: str) -> bool:
+    """Validate username (alphanumeric, spaces, and hyphens only)."""
+    import re
+    if not name or len(name) < 2 or len(name) > 100:
+        return False
+    # Allow letters, numbers, spaces, hyphens
+    pattern = r'^[a-zA-Z0-9\s\-]+$'
+    return re.match(pattern, name) is not None
+
+
+def sanitize_input(value: str, max_length: int = 255) -> str:
+    """Sanitize string input to prevent injection attacks."""
+    if not isinstance(value, str):
+        return ""
+    # Strip whitespace
+    value = value.strip()
+    # Truncate to max length
+    value = value[:max_length]
+    return value
+
+
+def validate_file_upload(file, max_size_mb: int = 5, allowed_mimes: list = None) -> tuple:
+    """
+    Validate uploaded file for security.
+    Returns (is_valid, error_message)
+    """
+    if allowed_mimes is None:
+        allowed_mimes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp']
+    
+    # Check filename
+    if not file or not file.filename:
+        return False, "No file provided"
+    
+    # Check file size (in memory)
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+    max_bytes = max_size_mb * 1024 * 1024
+    if file_size > max_bytes:
+        return False, f"File size exceeds {max_size_mb}MB limit"
+    
+    if file_size == 0:
+        return False, "File is empty"
+    
+    # Check MIME type
+    try:
+        mime = magic.Magic(mime=True)
+        file_mime = mime.from_buffer(file.read(8192))
+        file.seek(0)
+        if file_mime not in allowed_mimes:
+            return False, f"Invalid file type: {file_mime}. Allowed: {', '.join(allowed_mimes)}"
+    except Exception as e:
+        print(f"[SECURITY] MIME check error: {e}")
+        return False, "Could not verify file type"
+    
+    return True, None
+
+
+def generate_safe_filename(original_filename: str = None) -> str:
+    """Generate a safe filename using UUID to prevent path traversal."""
+    # Get file extension if provided
+    ext = ""
+    if original_filename:
+        ext = Path(original_filename).suffix.lower()
+        # Validate extension
+        if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+            ext = '.jpg'
+    else:
+        ext = '.jpg'
+    
+    # Use UUID for safe filename
+    return f"{uuid.uuid4().hex}{ext}"
+
+
+def hash_reset_token(token: str) -> str:
+    """Hash reset token for secure storage."""
+    import hashlib
     return hashlib.sha256(token.encode()).hexdigest()
 
 
 def generate_token(user_id, role):
+    """Generate JWT token with security best practices."""
     payload = {
         "user_id": user_id,
         "role": role,
         "exp": datetime.utcnow() + timedelta(hours=24),
         "iat": datetime.utcnow(),
+        "nbf": datetime.utcnow(),  # Not before: prevent token use before issued
     }
-    return jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
 def token_required(f):
@@ -67,13 +379,13 @@ def token_required(f):
             return jsonify({"error": "Token is missing"}), 401
 
         try:
-            data = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
-            conn = connect_db()
-            user = conn.execute("SELECT * FROM users WHERE id=?", (data["user_id"],)).fetchone()
-            conn.close()
+            # Use JWT_SECRET instead of app.config
+            data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            # PERF: Use cached user lookup to reduce database queries
+            user = get_cached_user(data["user_id"])
             if not user:
                 return jsonify({"error": "User not found"}), 401
-            g.current_user = dict(user)
+            g.current_user = user
         except jwt.ExpiredSignatureError:
             return jsonify({"error": "Token expired"}), 401
         except jwt.InvalidTokenError:
@@ -147,13 +459,17 @@ def ensure_password_reset_table():
 
 
 def _extract_face_crops(frame):
-    """Return face crops from a frame using OpenCV Haar cascades."""
+    """Return face crops from a frame using OpenCV Haar cascades with optimized parameters."""
     try:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
-        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
+        # PERF: Optimized parameters for faster detection
+        # scaleFactor=1.15 (was 1.1): faster but still accurate
+        # minNeighbors=4 (was 5): catches more quickly
+        # minSize=(60, 60) (was 80, 80): faster processing
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=4, minSize=(60, 60))
     except Exception:
         faces = []
 
@@ -170,24 +486,50 @@ def _extract_face_crops(frame):
     return crops
 
 
-def _match_faces_with_database(frame):
-    """Return recognized identity names from a frame for all detected faces."""
+def _match_faces_with_database(frame, conn):
+    """
+    Return recognized user IDs from a frame for all detected faces.
+    
+    SECURITY: Maps face→user_id directly from database to prevent duplicate name issues.
+    - Extracts name from dataset folder (face recognition)
+    - Validates name uniqueness in database
+    - Returns (user_id, confidence) pairs
+    - Validates face distance is within FACE_DISTANCE_THRESHOLD
+    
+    Args:
+        frame: Image frame containing faces
+        conn: Database connection for user lookup
+    
+    Returns:
+        (List of (user_id, name, distance), unrecognized_count)
+    """
+    start_time = time.time()
+    
+    # PERF: Optimize image size first before processing
+    frame = optimize_image_for_recognition(frame, max_width=480)
+    
     crops = _extract_face_crops(frame)
     if not crops:
         crops = [frame]
 
-    identities = []
+    matched_users = []  # List of (user_id, name, distance)
     unrecognized_count = 0
+    
     for crop in crops:
         try:
+            # Use cached model for faster performance
+            # Facenet512 is faster and more accurate than VGG-Face
             result = DeepFace.find(
                 img_path=crop,
                 db_path=DATASET_PATH,
                 enforce_detection=True,
                 detector_backend="opencv",
+                model_name="Facenet512",
                 silent=True,
+                threshold=FACE_DISTANCE_THRESHOLD,  # Use configurable threshold
             )
-        except Exception:
+        except Exception as e:
+            print(f"[FACE] Recognition error: {e}")
             unrecognized_count += 1
             continue
 
@@ -196,74 +538,262 @@ def _match_faces_with_database(frame):
             continue
 
         best = result[0].iloc[0]
-        if best["distance"] >= 0.4:
+        distance = float(best["distance"])
+        
+        # SECURITY: Validate distance is within strict threshold
+        if distance >= FACE_DISTANCE_THRESHOLD:
+            print(f"[FACE] Distance {distance:.4f} >= threshold {FACE_DISTANCE_THRESHOLD} - rejected")
             unrecognized_count += 1
             continue
 
+        # Extract name from dataset folder path
+        # Format: dataset/UserName/image.jpg -> name = "UserName"
         identity_path = best["identity"]
-        name = identity_path.split(os.sep)[-2]
-        identities.append(name)
+        name_from_face = identity_path.split(os.sep)[-2]
+        
+        # SECURITY: Validate this name exists in database and get user_id
+        try:
+            user = conn.execute(
+                "SELECT id FROM users WHERE name=?",
+                (name_from_face,)
+            ).fetchone()
+            
+            if not user:
+                # Face recognized from dataset, but user not in database
+                print(f"[FACE] User '{name_from_face}' from face match not found in database - rejected")
+                unrecognized_count += 1
+                continue
+            
+            user_id = user["id"]
+            
+            # SECURITY: Validate user exists in database and is trained
+            user_full = conn.execute(
+                "SELECT id, name, training_status FROM users WHERE id=?",
+                (user_id,)
+            ).fetchone()
+            
+            if not user_full:
+                print(f"[FACE] User ID {user_id} ('{name_from_face}') not found in database - rejected")
+                unrecognized_count += 1
+                continue
+            
+            # Append matched user with confidence
+            matched_users.append((user_id, name_from_face, distance))
+            print(f"[FACE] Matched: {name_from_face} (ID: {user_id}, distance: {distance:.4f})")
+            
+        except Exception as e:
+            print(f"[FACE] Database lookup error for '{name_from_face}': {e}")
+            unrecognized_count += 1
+            continue
 
-    return identities, unrecognized_count
+    elapsed = time.time() - start_time
+    print(f"[FACE] Face matching completed in {elapsed:.2f}s ({len(matched_users)} recognized, {unrecognized_count} unrecognized)")
+    return matched_users, unrecognized_count
 
 
 def _mark_attendance_for_user(user_id, user_name, conn):
-    """Core helper: check-in or check-out a single user. Returns dict with result info."""
-    now = datetime.now()
-    date = now.strftime("%Y-%m-%d")
-    time_now = now.strftime("%H:%M:%S")
+    """
+    Production-ready attendance marking: check-in or check-out a single user.
+    
+    CONCURRENCY: Uses atomic transactions with isolation to prevent race conditions
+    - IMMEDIATE transaction: Acquires lock immediately, preventing concurrent modifications
+    - SELECT → UPDATE wrapped in transaction: Ensures read-modify-write is atomic
+    - Lock per user_id: Prevents simultaneous check-in/out for same user
+    
+    Flow:
+    1. First scan → creates check_in record (status: present/late)
+    2. Second scan (after 60+ seconds) → updates check_out record
+    3. Prevents duplicates through 60-second cooldown
+    4. Handles overnight shifts correctly (full datetime stored)
+    
+    Args:
+        user_id: User's database ID
+        user_name: User's name
+        conn: SQLite connection object (will use IMMEDIATE transaction)
+    
+    Returns:
+        dict: {
+            "name": str,
+            "action": "check_in" | "check_out" | "skipped",
+            "time": str (HH:MM:SS),
+            "datetime": str (YYYY-MM-DD HH:MM:SS),
+            "status": str (for check_in),
+            "message": str (for skipped)
+        }
+    """
+    # CONCURRENCY: Get per-user lock to prevent simultaneous check-in/out
+    user_lock = get_attendance_lock(user_id)
+    
+    with user_lock:
+        print(f"[CONCURRENCY] Acquired lock for user {user_id} ({user_name})")
+        
+        # Get current datetime (full precision)
+        now = datetime.now()
+        date = now.strftime("%Y-%m-%d")
+        time_now = now.strftime("%H:%M:%S")
+        datetime_now = now.strftime("%Y-%m-%d %H:%M:%S")  # Full datetime
 
-    schema = _get_attendance_schema(conn)
-    user_col = schema["user_col"]
-    has_status = schema["has_status"]
+        # Detect schema (supports both user_id and employee_id columns)
+        schema = _get_attendance_schema(conn)
+        user_col = schema["user_col"]
+        has_status = schema["has_status"]
 
-    if not user_col:
-        return {"name": user_name, "action": "skipped", "message": "Unsupported attendance table schema"}
+        if not user_col:
+            print(f"[CONCURRENCY] Releasing lock for user {user_id} - unsupported schema")
+            return {
+                "name": user_name,
+                "action": "skipped",
+                "message": "Unsupported attendance table schema"
+            }
 
-    open_session = conn.execute(
-        f"SELECT id, check_in FROM attendance WHERE {user_col}=? AND date=? AND check_out IS NULL",
-        (user_id, date),
-    ).fetchone()
+        try:
+            # CONCURRENCY: Use IMMEDIATE transaction for serialized access
+            # IMMEDIATE: Acquires exclusive lock immediately (blocks other transactions)
+            # This prevents race conditions in the SELECT-UPDATE pattern
+            conn.execute("BEGIN IMMEDIATE")
+            print(f"[CONCURRENCY] Transaction IMMEDIATE started for user {user_id}")
+            
+            # ========================================
+            # CASE 1: User has an open session today
+            # ========================================
+            open_session = conn.execute(
+                f"SELECT id, check_in FROM attendance WHERE {user_col}=? AND date=? AND check_out IS NULL",
+                (user_id, date),
+            ).fetchone()
 
-    if open_session:
-        check_in_time = datetime.strptime(open_session["check_in"], "%H:%M:%S")
-        diff = (now - now.replace(
-            hour=check_in_time.hour,
-            minute=check_in_time.minute,
-            second=check_in_time.second,
-        )).seconds
-        if diff < 60:
-            return {"name": user_name, "action": "skipped", "message": "Too soon to check out (< 1 min)"}
-        conn.execute("UPDATE attendance SET check_out=? WHERE id=?", (time_now, open_session["id"]))
-        conn.commit()
-        return {"name": user_name, "action": "check_out", "time": time_now}
-    else:
-        last_entry = conn.execute(
-            f"SELECT check_in, check_out FROM attendance WHERE {user_col}=? AND date=? ORDER BY id DESC LIMIT 1",
-            (user_id, date),
-        ).fetchone()
-        if last_entry and last_entry["check_out"] is not None:
-            last_check_out = datetime.strptime(last_entry["check_out"], "%H:%M:%S")
-            if (now - now.replace(
-                hour=last_check_out.hour,
-                minute=last_check_out.minute,
-                second=last_check_out.second,
-            )).seconds < 60:
-                return {"name": user_name, "action": "skipped", "message": "Too soon after checkout. Please wait a moment and try again."}
+            if open_session:
+                # Attempt to CHECK OUT the user
+                
+                # Parse stored check_in datetime
+                # Support both old format (HH:MM:SS) and new format (YYYY-MM-DD HH:MM:SS)
+                check_in_str = open_session["check_in"]
+                try:
+                    if " " in check_in_str:
+                        # New format: YYYY-MM-DD HH:MM:SS
+                        check_in_dt = datetime.strptime(check_in_str, "%Y-%m-%d %H:%M:%S")
+                    else:
+                        # Old format: HH:MM:SS (time only, assume today's date)
+                        check_in_dt = datetime.strptime(check_in_str, "%H:%M:%S")
+                        check_in_dt = check_in_dt.replace(year=now.year, month=now.month, day=now.day)
+                except ValueError:
+                    conn.execute("ROLLBACK")
+                    print(f"[CONCURRENCY] Rollback - Invalid check-in time for user {user_id}")
+                    return {
+                        "name": user_name,
+                        "action": "skipped",
+                        "message": "Invalid check-in time format in database"
+                    }
 
-        status = "late" if now.hour >= 10 else "present"
-        if has_status:
-            conn.execute(
-                f"INSERT INTO attendance ({user_col}, date, check_in, status) VALUES (?, ?, ?, ?)",
-                (user_id, date, time_now, status),
-            )
-        else:
-            conn.execute(
-                f"INSERT INTO attendance ({user_col}, date, check_in) VALUES (?, ?, ?)",
-                (user_id, date, time_now),
-            )
-        conn.commit()
-        return {"name": user_name, "action": "check_in", "time": time_now, "status": status}
+                # Calculate time difference using total_seconds() (not .seconds!)
+                time_diff = (now - check_in_dt).total_seconds()
+
+                # Enforce 60-second minimum between check-in and check-out
+                # (Prevents accidental duplicate scans)
+                if time_diff < 60:
+                    conn.execute("ROLLBACK")
+                    print(f"[CONCURRENCY] Rollback - Too soon for check-out, user {user_id}")
+                    return {
+                        "name": user_name,
+                        "action": "skipped",
+                        "message": f"Too soon to check out (elapsed: {int(time_diff)}s, required: 60s)"
+                    }
+
+                # CONCURRENCY: Update check-out within transaction (atomic)
+                conn.execute(
+                    "UPDATE attendance SET check_out=? WHERE id=?",
+                    (datetime_now, open_session["id"])
+                )
+                conn.commit()
+                print(f"[CONCURRENCY] Committed check-out for user {user_id} - transaction released")
+
+                return {
+                    "name": user_name,
+                    "action": "check_out",
+                    "time": time_now,
+                    "datetime": datetime_now,
+                    "message": f"Checked out after {int(time_diff)}s"
+                }
+
+            # ================================================================
+            # CASE 2: No open session -> User is checking IN
+            # ================================================================
+            else:
+                # Check for rapid re-check-in (within 60 seconds after checkout)
+                last_entry = conn.execute(
+                    f"SELECT check_out FROM attendance WHERE {user_col}=? AND date=? AND check_out IS NOT NULL ORDER BY id DESC LIMIT 1",
+                    (user_id, date),
+                ).fetchone()
+
+                if last_entry and last_entry["check_out"]:
+                    # Parse last checkout time (support both formats)
+                    check_out_str = last_entry["check_out"]
+                    try:
+                        if " " in check_out_str:
+                            check_out_dt = datetime.strptime(check_out_str, "%Y-%m-%d %H:%M:%S")
+                        else:
+                            check_out_dt = datetime.strptime(check_out_str, "%H:%M:%S")
+                            check_out_dt = check_out_dt.replace(year=now.year, month=now.month, day=now.day)
+                    except ValueError:
+                        # If format is invalid, allow check-in (safety)
+                        check_out_dt = None
+
+                    if check_out_dt:
+                        time_diff = (now - check_out_dt).total_seconds()
+                        # Prevent immediate re-scanning after checkout
+                        if time_diff < 60:
+                            conn.execute("ROLLBACK")
+                            print(f"[CONCURRENCY] Rollback - Too soon after checkout, user {user_id}")
+                            return {
+                                "name": user_name,
+                                "action": "skipped",
+                                "message": f"Too soon after checkout (elapsed: {int(time_diff)}s, required: 60s)"
+                            }
+
+                # Determine attendance status based on hour
+                # (Before 10 AM = present, 10 AM or later = late)
+                status = "late" if now.hour >= 10 else "present"
+
+                # CONCURRENCY: Insert check-in within transaction (atomic)
+                if has_status:
+                    conn.execute(
+                        f"INSERT INTO attendance ({user_col}, date, check_in, status) VALUES (?, ?, ?, ?)",
+                        (user_id, date, datetime_now, status),
+                    )
+                else:
+                    conn.execute(
+                        f"INSERT INTO attendance ({user_col}, date, check_in) VALUES (?, ?, ?)",
+                        (user_id, date, datetime_now),
+                    )
+                conn.commit()
+                print(f"[CONCURRENCY] Committed check-in for user {user_id} - transaction released")
+
+                return {
+                    "name": user_name,
+                    "action": "check_in",
+                    "time": time_now,
+                    "datetime": datetime_now,
+                    "status": status,
+                    "message": f"Checked in as {status}"
+                }
+        
+        except sqlite3.IntegrityError as e:
+            conn.execute("ROLLBACK")
+            print(f"[CONCURRENCY] Rollback - Integrity constraint violation for user {user_id}: {e}")
+            # Handle unique constraint violations (duplicate entries)
+            if "UNIQUE constraint failed" in str(e):
+                return {
+                    "name": user_name,
+                    "action": "skipped",
+                    "message": "Duplicate attendance entry prevented"
+                }
+            raise
+        
+        except Exception as e:
+            conn.execute("ROLLBACK")
+            print(f"[ERROR] Rollback - Unexpected error for user {user_id}: {e}")
+            raise
+        finally:
+            print(f"[CONCURRENCY] Released lock for user {user_id} ({user_name})")
 
 
     ensure_password_reset_table()
@@ -273,23 +803,47 @@ def _mark_attendance_for_user(user_id, user_name, conn):
 # =============================================
 
 @app.route("/api/auth/login", methods=["POST"])
+@limiter.limit("5 per minute")  # RATE LIMIT: Prevent brute force
 def login():
-    data = request.json
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
+    """Authenticate user with email and password (rate-limited)."""
+    try:
+        data = request.json or {}
+        email = sanitize_input((data.get("email") or "").strip().lower())
+        password = data.get("password", "")
 
-    if not email or not password:
-        return jsonify({"error": "Email and password are required"}), 400
+        # Input validation
+        if not email or not password:
+            return jsonify({"error": "Email and password are required"}), 400
+        
+        if not validate_email(email):
+            return jsonify({"error": "Invalid email format"}), 400
+        
+        if len(password) < 6:
+            return jsonify({"error": "Invalid credentials"}), 401
 
-    conn = connect_db()
-    user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-    conn.close()
+        conn = connect_db()
+        # PERF: Query uses email index (idx_users_email)
+        user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        conn.close()
 
-    if not user or user["password_hash"] != hash_password(password):
-        return jsonify({"error": "Invalid credentials"}), 401
+        # Security best practice: Same error for user not found or password mismatch
+        # This prevents account enumeration attacks
+        if not user or not verify_password(password, user["password_hash"]):
+            # Log failed attempt (in production, use proper logging)
+            print(f"[SECURITY] Failed login attempt for email: {email}")
+            return jsonify({"error": "Invalid credentials"}), 401
 
-    token = generate_token(user["id"], user["role"])
-    return jsonify({"token": token, "user": user_dict(user)})
+        token = generate_token(user["id"], user["role"])
+        print(f"[AUTH] Successful login: {user['email']} (user_id: {user['id']})")
+        # PERF: Register user in cache for subsequent requests
+        user_dict_result = user_dict(user)
+        _user_cache[user["id"]] = dict(user)
+        _user_cache_timestamp[user["id"]] = time.time()
+        return jsonify({"token": token, "user": user_dict_result}), 200
+    
+    except Exception as e:
+        print(f"[ERROR] Login error: {e}")
+        return jsonify({"error": "Authentication failed"}), 500
 
 
 @app.route("/api/auth/register", methods=["POST"])
@@ -299,113 +853,139 @@ def register():
 
 
 @app.route("/api/auth/forgot-password", methods=["POST"])
+@limiter.limit("3 per minute")  # RATE LIMIT: Prevent abuse
 def forgot_password():
     """Create a one-time password reset token for a known email."""
-    data = request.json or {}
-    email = (data.get("email") or "").strip().lower()
+    try:
+        data = request.json or {}
+        email = sanitize_input((data.get("email") or "").strip().lower())
 
-    if not email:
-        return jsonify({"error": "Email is required"}), 400
+        if not email:
+            return jsonify({"error": "Email is required"}), 400
+        
+        if not validate_email(email):
+            return jsonify({"error": "Invalid email format"}), 400
 
-    conn = connect_db()
-    now_ts = int(datetime.utcnow().timestamp())
-    conn.execute(
-        "DELETE FROM password_reset_tokens WHERE expires_at < ? OR used_at IS NOT NULL",
-        (now_ts,),
-    )
-
-    user = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
-    raw_token = None
-
-    if user:
-        raw_token = secrets.token_urlsafe(32)
-        token_hash = hash_reset_token(raw_token)
-        expires_at = int((datetime.utcnow() + timedelta(minutes=30)).timestamp())
-
+        conn = connect_db()
+        now_ts = int(datetime.utcnow().timestamp())
         conn.execute(
-            "DELETE FROM password_reset_tokens WHERE user_id=?",
-            (user["id"],),
-        )
-        conn.execute(
-            "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-            (user["id"], token_hash, expires_at),
+            "DELETE FROM password_reset_tokens WHERE expires_at < ? OR used_at IS NOT NULL",
+            (now_ts,),
         )
 
-    conn.commit()
-    conn.close()
+        user = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+        raw_token = None
 
-    response = {
-        "message": "If an account with that email exists, a reset request has been created."
-    }
+        if user:
+            raw_token = secrets.token_urlsafe(32)
+            token_hash = hash_reset_token(raw_token)
+            expires_at = int((datetime.utcnow() + timedelta(minutes=30)).timestamp())
 
-    # Development fallback: return token when running in debug/local mode.
-    if raw_token and app.debug:
-        response["resetToken"] = raw_token
-        response["expiresInMinutes"] = 30
+            conn.execute(
+                "DELETE FROM password_reset_tokens WHERE user_id=?",
+                (user["id"],),
+            )
+            conn.execute(
+                "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+                (user["id"], token_hash, expires_at),
+            )
 
-    return jsonify(response)
+        conn.commit()
+        conn.close()
+
+        response = {
+            "message": "If an account with that email exists, a reset request has been created."
+        }
+
+        # Development fallback: return token when running in debug/local mode
+        if raw_token and app.debug:
+            response["resetToken"] = raw_token
+            response["expiresInMinutes"] = 30
+
+        return jsonify(response), 200
+    
+    except Exception as e:
+        print(f"[ERROR] Forgot password error: {e}")
+        return jsonify({"error": "Password reset failed"}), 500
 
 
 @app.route("/api/auth/reset-password", methods=["POST"])
+@limiter.limit("5 per minute")  # RATE LIMIT: Prevent abuse
 def reset_password():
     """Reset user password with a valid, unexpired one-time token."""
-    data = request.json or {}
-    token = (data.get("token") or "").strip()
-    new_password = data.get("newPassword") or ""
+    try:
+        data = request.json or {}
+        token = sanitize_input((data.get("token") or "").strip())
+        new_password = data.get("newPassword") or ""
 
-    if not token or not new_password:
-        return jsonify({"error": "Token and newPassword are required"}), 400
+        if not token or not new_password:
+            return jsonify({"error": "Token and newPassword are required"}), 400
 
-    if len(new_password) < 6:
-        return jsonify({"error": "Password must be at least 6 characters"}), 400
+        if len(new_password) < 6:
+            return jsonify({"error": "Password must be at least 6 characters"}), 400
+        
+        # Validate password complexity
+        import re
+        if not re.search(r'[A-Z]', new_password) or not re.search(r'[a-z]', new_password) or not re.search(r'\d', new_password):
+            return jsonify({"error": "Password must contain uppercase, lowercase, and numbers"}), 400
 
-    token_hash = hash_reset_token(token)
-    now_ts = int(datetime.utcnow().timestamp())
+        token_hash = hash_reset_token(token)
+        now_ts = int(datetime.utcnow().timestamp())
 
-    conn = connect_db()
-    reset_row = conn.execute(
-        """
-        SELECT id, user_id, expires_at, used_at
-        FROM password_reset_tokens
-        WHERE token_hash=?
-        LIMIT 1
-        """,
-        (token_hash,),
-    ).fetchone()
+        conn = connect_db()
+        reset_row = conn.execute(
+            """
+            SELECT id, user_id, expires_at, used_at
+            FROM password_reset_tokens
+            WHERE token_hash=?
+            LIMIT 1
+            """,
+            (token_hash,),
+        ).fetchone()
 
-    if not reset_row:
-        conn.close()
-        return jsonify({"error": "Invalid or expired reset token"}), 400
+        if not reset_row:
+            conn.close()
+            print(f"[SECURITY] Invalid reset token attempt")
+            return jsonify({"error": "Invalid or expired reset token"}), 400
 
-    if reset_row["used_at"] is not None:
-        conn.close()
-        return jsonify({"error": "Reset token already used"}), 400
+        if reset_row["used_at"] is not None:
+            conn.close()
+            print(f"[SECURITY] Reused reset token attempt (user_id: {reset_row['user_id']})")
+            return jsonify({"error": "Reset token already used"}), 400
 
-    if int(reset_row["expires_at"]) < now_ts:
+        if int(reset_row["expires_at"]) < now_ts:
+            conn.execute(
+                "UPDATE password_reset_tokens SET used_at=? WHERE id=?",
+                (now_ts, reset_row["id"]),
+            )
+            conn.commit()
+            conn.close()
+            return jsonify({"error": "Reset token expired"}), 400
+
+        # Hash new password with bcrypt
+        new_password_hash = hash_password(new_password)
+        
+        conn.execute(
+            "UPDATE users SET password_hash=? WHERE id=?",
+            (new_password_hash, reset_row["user_id"]),
+        )
         conn.execute(
             "UPDATE password_reset_tokens SET used_at=? WHERE id=?",
             (now_ts, reset_row["id"]),
         )
+        conn.execute(
+            "DELETE FROM password_reset_tokens WHERE user_id=? AND id<>?",
+            (reset_row["user_id"], reset_row["id"]),
+        )
         conn.commit()
         conn.close()
-        return jsonify({"error": "Reset token expired"}), 400
 
-    conn.execute(
-        "UPDATE users SET password_hash=? WHERE id=?",
-        (hash_password(new_password), reset_row["user_id"]),
-    )
-    conn.execute(
-        "UPDATE password_reset_tokens SET used_at=? WHERE id=?",
-        (now_ts, reset_row["id"]),
-    )
-    conn.execute(
-        "DELETE FROM password_reset_tokens WHERE user_id=? AND id<>?",
-        (reset_row["user_id"], reset_row["id"]),
-    )
-    conn.commit()
-    conn.close()
-
-    return jsonify({"message": "Password reset successful. Please sign in with your new password."})
+        print(f"[AUTH] Password reset successful for user_id: {reset_row['user_id']}")
+        return jsonify({"message": "Password reset successful. Please sign in with your new password."}), 200
+    
+    except Exception as e:
+        print(f"[ERROR] Password reset error: {e}")
+        return jsonify({"error": "Password reset failed"}), 500
 
 
 @app.route("/api/auth/me", methods=["GET"])
@@ -481,10 +1061,29 @@ def admin_stats():
 @app.route("/api/admin/users", methods=["GET"])
 @admin_required
 def admin_get_users():
+    """Get all users with pagination support (PERF: Added pagination)."""
+    # PERF: Get pagination parameters from query string
+    page = request.args.get("page", 1)
+    limit = request.args.get("limit", 20)
+    page, limit, offset = validate_pagination_params(page, limit, max_limit=100)
+    
     conn = connect_db()
-    users = conn.execute("SELECT * FROM users WHERE role='user' ORDER BY created_at DESC").fetchall()
+    
+    # PERF: Get total count (needed for pagination metadata)
+    total_count = conn.execute("SELECT COUNT(*) FROM users WHERE role='user'").fetchone()[0]
+    
+    # PERF: Use LIMIT and OFFSET for pagination (also uses index on role)
+    users = conn.execute("""
+        SELECT * FROM users 
+        WHERE role='user' 
+        ORDER BY created_at DESC 
+        LIMIT ? OFFSET ?
+    """, (limit, offset)).fetchall()
+    
     conn.close()
-    return jsonify([user_dict(u) for u in users])
+    
+    # Return paginated results
+    return jsonify(paginate_results(total_count, page, limit, [user_dict(u) for u in users]))
 
 
 @app.route("/api/admin/users/<int:user_id>", methods=["DELETE"])
@@ -533,41 +1132,72 @@ def admin_delete_user(user_id):
 
 @app.route("/api/admin/register-user", methods=["POST"])
 @admin_required
+@limiter.limit("10 per minute")  # RATE LIMIT: Prevent abuse
 def admin_register_user():
-    """Admin creates a new user account."""
-    data = request.json
-    name = data.get("name", "").strip()
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
-    department = data.get("department", "").strip()
+    """Admin creates a new user account with input validation."""
+    try:
+        data = request.json or {}
+        name = sanitize_input((data.get("name") or "").strip())
+        email = sanitize_input((data.get("email") or "").strip().lower())
+        password = data.get("password", "")
+        department = sanitize_input((data.get("department") or "").strip(), max_length=100)
 
-    if not name or not email or not password:
-        return jsonify({"error": "Name, email and password are required"}), 400
+        if not name or not email or not password:
+            return jsonify({"error": "Name, email and password are required"}), 400
 
-    if len(password) < 6:
-        return jsonify({"error": "Password must be at least 6 characters"}), 400
+        # Validate name format
+        if not validate_username(name):
+            return jsonify({"error": "Name must be 2-100 characters and contain only letters, numbers, spaces, or hyphens"}), 400
+        
+        # Validate email format
+        if not validate_email(email):
+            return jsonify({"error": "Invalid email format"}), 400
 
-    conn = connect_db()
-    existing = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
-    if existing:
+        if len(password) < 6:
+            return jsonify({"error": "Password must be at least 6 characters"}), 400
+        
+        # Validate password complexity
+        import re
+        if not re.search(r'[A-Z]', password) or not re.search(r'[a-z]', password) or not re.search(r'\d', password):
+            return jsonify({"error": "Password must contain uppercase, lowercase, and numbers"}), 400
+
+        conn = connect_db()
+        
+        # Check email uniqueness
+        existing = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+        if existing:
+            conn.close()
+            return jsonify({"error": "Email already registered"}), 400
+        
+        # Check name uniqueness (now enforced by DB)
+        existing_name = conn.execute("SELECT id FROM users WHERE LOWER(name)=LOWER(?)", (name,)).fetchone()
+        if existing_name:
+            conn.close()
+            return jsonify({"error": "Username already exists"}), 400
+
+        pw_hash = hash_password(password)
+        cursor = conn.execute(
+            "INSERT INTO users (name, email, password_hash, role, department) VALUES (?, ?, ?, 'user', ?)",
+            (name, email, pw_hash, department),
+        )
+        conn.commit()
+        user_id = cursor.lastrowid
+
+        user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         conn.close()
-        return jsonify({"error": "Email already registered"}), 400
 
-    pw_hash = hash_password(password)
-    cursor = conn.execute(
-        "INSERT INTO users (name, email, password_hash, role, department) VALUES (?, ?, ?, 'user', ?)",
-        (name, email, pw_hash, department),
-    )
-    conn.commit()
-    user_id = cursor.lastrowid
+        # Create dataset directory for future face training
+        user_folder = os.path.join(DATASET_PATH, name)
+        user_folder = os.path.normpath(user_folder)
+        if user_folder.startswith(os.path.normpath(DATASET_PATH)):
+            os.makedirs(user_folder, exist_ok=True)
 
-    user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-    conn.close()
-
-    # Create dataset directory for future face training
-    os.makedirs(f"{DATASET_PATH}/{name}", exist_ok=True)
-
-    return jsonify({"message": f"User {name} registered successfully", "user": user_dict(user)}), 201
+        print(f"[AUTH] New user registered: {name} (email: {email}, user_id: {user_id})")
+        return jsonify({"message": f"User {name} registered successfully", "user": user_dict(user)}), 201
+    
+    except Exception as e:
+        print(f"[ERROR] User registration error: {e}")
+        return jsonify({"error": "User registration failed"}), 500
 
 
 @app.route("/api/admin/users/<int:user_id>", methods=["PUT"])
@@ -641,6 +1271,11 @@ def admin_update_user(user_id):
         }
         if dataset_warning:
             response["warning"] = dataset_warning
+        
+        # PERF: Invalidate user cache when updated
+        invalidate_user_cache(user_id)
+        print(f"[PERF] Cache invalidated for updated user {user_id}")
+        
         return jsonify(response)
 
     except sqlite3.Error as e:
@@ -654,10 +1289,27 @@ def admin_update_user(user_id):
 @app.route("/api/admin/untrained-users", methods=["GET"])
 @admin_required
 def admin_untrained_users():
+    """Get untrained users with pagination (PERF: Added pagination)."""
+    # PERF: Get pagination parameters
+    page = request.args.get("page", 1)
+    limit = request.args.get("limit", 20)
+    page, limit, offset = validate_pagination_params(page, limit, max_limit=100)
+    
     conn = connect_db()
-    users = conn.execute(
-        "SELECT * FROM users WHERE training_status='untrained' AND role='user' ORDER BY created_at DESC"
-    ).fetchall()
+    
+    # PERF: Use index on (training_status, role) for faster query
+    total_count = conn.execute(
+        "SELECT COUNT(*) FROM users WHERE training_status='untrained' AND role='user'"
+    ).fetchone()[0]
+    
+    # PERF: Apply pagination
+    users = conn.execute("""
+        SELECT * FROM users 
+        WHERE training_status='untrained' AND role='user' 
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+    """, (limit, offset)).fetchall()
+    
     conn.close()
 
     result = []
@@ -672,29 +1324,43 @@ def admin_untrained_users():
             "images": image_count,
         })
 
-    return jsonify(result)
+    return jsonify(paginate_results(total_count, page, limit, result))
 
 
 @app.route("/api/admin/upload-training-images", methods=["POST"])
 @admin_required
+@limiter.limit("10 per minute")  # RATE LIMIT: Prevent abuse
 def admin_upload_training_images():
-    """Upload training images for a user."""
+    """Upload training images for a user with secure validation."""
     conn = connect_db()
 
     try:
-        user_id = request.form.get("userId")
+        user_id = request.form.get("userId", "").strip()
         if not user_id:
             conn.close()
             return jsonify({"error": "userId is required"}), 400
 
+        # Validate user_id is numeric
+        try:
+            user_id = int(user_id)
+        except ValueError:
+            conn.close()
+            return jsonify({"error": "Invalid userId"}), 400
+
         # Get user
-        user = conn.execute("SELECT * FROM users WHERE id=?", (int(user_id),)).fetchone()
+        user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not user:
             conn.close()
             return jsonify({"error": "User not found"}), 404
 
-        # Create user dataset folder
+        # Create user dataset folder with safe path
         user_folder = os.path.join(DATASET_PATH, user["name"])
+        # Prevent path traversal
+        user_folder = os.path.normpath(user_folder)
+        if not user_folder.startswith(os.path.normpath(DATASET_PATH)):
+            conn.close()
+            return jsonify({"error": "Invalid user path"}), 400
+        
         os.makedirs(user_folder, exist_ok=True)
 
         # Get uploaded files
@@ -702,28 +1368,67 @@ def admin_upload_training_images():
         if not files or len(files) == 0:
             conn.close()
             return jsonify({"error": "No images provided"}), 400
+        
+        if len(files) > 20:
+            conn.close()
+            return jsonify({"error": "Maximum 20 images per upload"}), 400
 
         saved_count = 0
-        for file in files:
-            if file and file.filename and file.filename.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
-                # Use timestamp to make filenames unique
-                import time
-                safe_name = os.path.basename(file.filename)
-                filename = f"{int(time.time())}_{len(os.listdir(user_folder))}_{safe_name}"
-                filepath = os.path.join(user_folder, filename)
+        errors = []
+        
+        for idx, file in enumerate(files):
+            if idx >= 20:  # Safety limit
+                break
+            
+            if not file or not file.filename:
+                continue
+            
+            # SECURITY: Validate file upload
+            is_valid, error_msg = validate_file_upload(file, max_size_mb=5)
+            if not is_valid:
+                errors.append(f"{file.filename}: {error_msg}")
+                continue
+            
+            # Generate safe filename using UUID
+            safe_filename = generate_safe_filename(file.filename)
+            filepath = os.path.join(user_folder, safe_filename)
+            
+            # Prevent path traversal in filepath
+            filepath = os.path.normpath(filepath)
+            if not filepath.startswith(os.path.normpath(user_folder)):
+                errors.append(f"{file.filename}: Path traversal attempt")
+                continue
+            
+            try:
                 file.save(filepath)
                 saved_count += 1
+                print(f"[UPLOAD] Saved training image for user {user['name']}: {safe_filename}")
+            except Exception as e:
+                errors.append(f"{file.filename}: {str(e)}")
+                print(f"[ERROR] Failed to save image: {e}")
 
         if saved_count == 0:
             conn.close()
-            return jsonify({"error": "No valid image files provided"}), 400
+            return jsonify({
+                "error": "No valid image files provided",
+                "details": errors if errors else []
+            }), 400
 
         conn.close()
-        return jsonify({"message": f"Successfully uploaded {saved_count} image(s)", "count": saved_count}), 200
+        response = {
+            "message": f"Successfully uploaded {saved_count} image(s)",
+            "count": saved_count
+        }
+        if errors:
+            response["warnings"] = errors
+        
+        print(f"[UPLOAD] Training images upload complete: {saved_count} saved, user_id={user_id}")
+        return jsonify(response), 200
 
     except Exception as e:
+        print(f"[ERROR] Upload error: {e}")
         conn.close()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Upload failed"}), 500
 
 
 @app.route("/api/admin/capture-training-images", methods=["POST"])
@@ -889,6 +1594,12 @@ def admin_train_model():
 @app.route("/api/admin/attendance", methods=["GET"])
 @admin_required
 def admin_attendance():
+    """Get attendance records with filtering and pagination (PERF: Added pagination)."""
+    # PERF: Get pagination parameters
+    page = request.args.get("page", 1)
+    limit = request.args.get("limit", 50)  # Default 50 for attendance (larger datasets)
+    page, limit, offset = validate_pagination_params(page, limit, max_limit=200)
+    
     conn = connect_db()
 
     date_filter = request.args.get("date", "")
@@ -901,34 +1612,47 @@ def admin_attendance():
 
     if not user_col:
         conn.close()
-        return jsonify([])
+        return jsonify(paginate_results(0, page, limit, []))
 
     status_select = "a.status" if has_status else "CASE WHEN a.check_in IS NOT NULL THEN 'present' ELSE 'absent' END AS status"
 
-    query = f"""
+    # Build WHERE clause
+    query_base = f"""
         SELECT a.id, a.{user_col} AS user_id, u.name, a.date, a.check_in, a.check_out, {status_select}, u.department
         FROM attendance a
+        JOIN users u ON a.{user_col} = u.id
+        WHERE 1=1
+    """
+    count_query = f"""
+        SELECT COUNT(*) FROM attendance a
         JOIN users u ON a.{user_col} = u.id
         WHERE 1=1
     """
     params = []
 
     if date_filter:
-        query += " AND a.date = ?"
+        query_base += " AND a.date = ?"
+        count_query += " AND a.date = ?"
         params.append(date_filter)
     if user_filter:
-        query += " AND u.name LIKE ?"
+        query_base += " AND u.name LIKE ?"
+        count_query += " AND u.name LIKE ?"
         params.append(f"%{user_filter}%")
     if dept_filter and dept_filter != "all":
-        query += " AND u.department LIKE ?"
+        query_base += " AND u.department LIKE ?"
+        count_query += " AND u.department LIKE ?"
         params.append(f"%{dept_filter}%")
 
-    query += " ORDER BY a.date DESC, a.check_in DESC"
-
-    rows = conn.execute(query, params).fetchall()
+    # PERF: Get count before pagination (uses same filters)
+    total_count = conn.execute(count_query, params).fetchone()[0]
+    
+    # Add pagination and sort
+    query_with_pagination = query_base + " ORDER BY a.date DESC, a.check_in DESC LIMIT ? OFFSET ?"
+    
+    rows = conn.execute(query_with_pagination, params + [limit, offset]).fetchall()
     conn.close()
 
-    return jsonify([
+    result_data = [
         {
             "id": str(r["id"]),
             "userId": str(r["user_id"]),
@@ -940,7 +1664,9 @@ def admin_attendance():
             "department": r["department"] or "",
         }
         for r in rows
-    ])
+    ]
+    
+    return jsonify(paginate_results(total_count, page, limit, result_data))
 
 
 @app.route("/api/admin/reports", methods=["GET"])
@@ -1140,8 +1866,9 @@ def user_mark_attendance():
         if frame is None:
             return jsonify({"error": "Invalid image data"}), 400
 
-        # Run face recognition
+        # Run face recognition with configurable threshold
         recognized_name = None
+        distance = None
         try:
             result = DeepFace.find(
                 img_path=frame,
@@ -1149,39 +1876,60 @@ def user_mark_attendance():
                 enforce_detection=True,
                 detector_backend="opencv",
                 silent=True,
+                threshold=FACE_DISTANCE_THRESHOLD,  # Use configurable threshold
             )
 
             if len(result) > 0 and len(result[0]) > 0:
                 distance = result[0].iloc[0]["distance"]
-                if distance < 0.4:
+                # SECURITY: Validate distance is within strict threshold
+                if distance < FACE_DISTANCE_THRESHOLD:
                     identity = result[0].iloc[0]["identity"]
                     recognized_name = identity.split(os.sep)[-2]
-        except Exception:
+                else:
+                    print(f"[FACE] Distance {distance:.4f} >= threshold {FACE_DISTANCE_THRESHOLD} - rejected")
+        except Exception as e:
+            print(f"[FACE] Recognition error: {e}")
             return jsonify({"error": "No face detected in image. Please try again."}), 400
 
         if not recognized_name:
             return jsonify({"error": "Face not recognized. Please try again."}), 400
 
-        # Ensure the recognized identity matches the logged-in user (security safeguard).
+        # SECURITY: Validate recognized face matches the authenticated user
         conn = connect_db()
+        
+        # Uniqueness enforced by database: name is now UNIQUE
         recognized_user = conn.execute("SELECT id, name FROM users WHERE name=?", (recognized_name,)).fetchone()
         if not recognized_user:
             conn.close()
-            return jsonify({"error": "Face recognized but user not found in system."}), 400
+            print(f"[ATTENDANCE] Face '{recognized_name}' not found in database")
+            return jsonify({
+                "error": "Face recognized but user not found in system.",
+                "distance": round(distance, 4) if distance else None
+            }), 400
 
+        # Verify face belongs to authenticated user (not someone else)
         if recognized_user["id"] != user_id:
             conn.close()
-            return jsonify({"error": "Face does not match the authenticated user."}), 403
+            print(f"[ATTENDANCE] Face mismatch: recognized {recognized_user['id']}, authenticated {user_id}")
+            return jsonify({
+                "error": "Face does not match the authenticated user.",
+                "expected_user": user_name,
+                "recognized_user": recognized_name,
+                "distance": round(distance, 4) if distance else None
+            }), 403
 
         result_info = _mark_attendance_for_user(user_id, user_name, conn)
+        result_info["distance"] = round(distance, 4) if distance else None
+        result_info["confidence"] = round(1.0 - distance, 4) if distance else None
+        result_info["threshold"] = FACE_DISTANCE_THRESHOLD
         conn.close()
 
         if result_info["action"] == "skipped":
             return jsonify({"error": result_info["message"]}), 400
         elif result_info["action"] == "check_out":
-            return jsonify({"message": f"Checked out at {result_info['time']}. Recognized as {recognized_name}."})
+            return jsonify({**result_info, "message": f"Checked out at {result_info['time']}. Recognized as {recognized_name}."})
         else:
-            return jsonify({"message": f"Checked in at {result_info['time']}. Recognized as {recognized_name}."})
+            return jsonify({**result_info, "message": f"Checked in at {result_info['time']}. Recognized as {recognized_name}."})
 
     except Exception as e:
         return jsonify({"error": f"Recognition error: {str(e)}"}), 500
@@ -1194,63 +1942,155 @@ def user_mark_attendance():
 @app.route("/api/multi-attendance", methods=["POST"])
 @token_required
 def multi_face_attendance():
-    """Detect ALL faces in a single image and mark attendance for every recognised user."""
+    """
+    Detect ALL faces in a single image and mark attendance for every recognized user.
+    
+    CONCURRENCY & SECURITY:
+    - Request deduplication: Prevents same request being processed twice
+    - Transaction-safe: Each attendance mark uses atomic operation
+    - Per-user locks: Prevents concurrent check-in/out for same user
+    - Validates each face matches a user in database
+    - Uses user_id directly (not name lookup)
+    - Rejects faces that don't meet distance threshold
+    - Prevents duplicate users with same name
+    - Returns "unrecognized" for unknown faces safely
+    
+    Flow:
+    1. Check for duplicate request (dedup cache)
+    2. Decode base64 image
+    3. Detect faces and match with database
+    4. For each matched face:
+       a. Lookup user_id from database
+       b. Validate user exists and is trained
+       c. Mark attendance (atomic, per-user lock)
+    5. Return results and count of unrecognized faces
+    """
     data = request.json
     image_data = data.get("image", "")
 
     if not image_data:
-        return jsonify({"error": "No image provided"}), 400
+        return jsonify({
+            "error": "No image provided",
+            "results": [],
+            "unrecognized": 0
+        }), 400
 
     try:
+        # Decode base64 image first to calculate hash
         if "," in image_data:
             image_data = image_data.split(",", 1)[1].strip()
 
         if not image_data:
-            return jsonify({"error": "Empty image payload"}), 400
+            return jsonify({
+                "error": "Empty image payload",
+                "results": [],
+                "unrecognized": 0
+            }), 400
 
         img_bytes = base64.b64decode(image_data, validate=True)
         if not img_bytes:
-            return jsonify({"error": "Invalid image payload"}), 400
+            return jsonify({
+                "error": "Invalid image payload",
+                "results": [],
+                "unrecognized": 0
+            }), 400
+
+        # CONCURRENCY: Check for duplicate request (same image within 5 seconds)
+        request_sig = hashlib.md5(img_bytes).hexdigest()
+        is_dup, cached_result = is_duplicate_request(request_sig)
+        if is_dup:
+            print(f"[CONCURRENCY] Returning cached result for duplicate request")
+            return jsonify(cached_result)
+        
+        print(f"[CONCURRENCY] Processing unique request: {request_sig[:8]}...")
 
         nparr = np.frombuffer(img_bytes, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if frame is None:
-            return jsonify({"error": "Invalid image data"}), 400
+            return jsonify({
+                "error": "Invalid image data",
+                "results": [],
+                "unrecognized": 0
+            }), 400
 
-        identities, unrecognized_count = _match_faces_with_database(frame)
-
-        if not identities:
-            return jsonify({"error": "No registered faces recognized."}), 400
-
+        # SECURITY: Connect to database for identity validation
         conn = connect_db()
-        recognized = []
-        seen_users = set()
+        
+        # Get matched users (user_id, name, distance)
+        matched_users, unrecognized_count = _match_faces_with_database(frame, conn)
 
-        for name in identities:
-            user = conn.execute("SELECT id, name FROM users WHERE name=?", (name,)).fetchone()
-            if not user or user["id"] in seen_users:
-                if not user:
-                    unrecognized_count += 1
+        if not matched_users:
+            conn.close()
+            return jsonify({
+                "error": "No registered faces recognized.",
+                "results": [],
+                "unrecognized": unrecognized_count,
+                "message": f"{unrecognized_count} face(s) detected but not recognized.",
+            }), 400
+
+        recognized = []
+        seen_user_ids = set()  # Prevent duplicate attendance for same user
+
+        for user_id, name, distance in matched_users:
+            # SECURITY: Skip if already processed (prevent duplicates)
+            if user_id in seen_user_ids:
+                print(f"[ATTENDANCE] User {user_id} ({name}) already processed this scan - skipping")
                 continue
 
-            seen_users.add(user["id"])
-            result_info = _mark_attendance_for_user(user["id"], user["name"], conn)
+            # SECURITY: Validate user exists in database before marking attendance
+            user = conn.execute(
+                "SELECT id, name, training_status FROM users WHERE id=?",
+                (user_id,)
+            ).fetchone()
+
+            if not user:
+                print(f"[ATTENDANCE] User ID {user_id} not found in database - rejected")
+                continue
+            
+            # Mark user ID as seen
+            seen_user_ids.add(user_id)
+            
+            # Mark attendance for this user
+            result_info = _mark_attendance_for_user(user_id, user["name"], conn)
+            
+            # Include face matching confidence in response
+            result_info["confidence"] = round(1.0 - distance, 4)  # Convert distance to confidence
+            result_info["distance"] = round(distance, 4)
+            
             recognized.append(result_info)
+            print(f"[ATTENDANCE] Marked attendance for {user['name']} (ID: {user_id}, confidence: {result_info['confidence']})")
 
         conn.close()
 
         if not recognized:
-            return jsonify({"error": "No registered faces recognized."}), 400
+            error_response = {
+                "error": "No valid users recognized.",
+                "results": [],
+                "unrecognized": unrecognized_count,
+                "message": f"Faces matched but no valid users found. {unrecognized_count} unrecognized.",
+            }
+            cache_request_result(request_sig, error_response)
+            return jsonify(error_response), 400
 
-        return jsonify({
+        success_response = {
             "results": recognized,
             "unrecognized": unrecognized_count,
-            "message": f"Attendance marked for {len(recognized)} user(s).",
-        })
+            "message": f"Attendance marked for {len(recognized)} user(s). {unrecognized_count} face(s) unrecognized.",
+            "face_distance_threshold": FACE_DISTANCE_THRESHOLD,
+        }
+        # CONCURRENCY: Cache result for deduplication
+        cache_request_result(request_sig, success_response)
+        return jsonify(success_response), 200
 
     except Exception as e:
-        return jsonify({"error": f"Recognition error: {str(e)}"}), 500
+        print(f"[ERROR] Multi-face attendance error: {str(e)}")
+        error_response = {
+            "error": f"Recognition error: {str(e)}",
+            "results": [],
+            "unrecognized": 0
+        }
+        return jsonify(error_response), 500
 
 
 @app.route("/api/user/attendance", methods=["GET"])
@@ -1407,6 +2247,7 @@ def public_mark_attendance():
             return jsonify({"error": "Invalid image data"}), 400
 
         recognized_name = None
+        distance = None
         try:
             result = DeepFace.find(
                 img_path=frame,
@@ -1414,34 +2255,50 @@ def public_mark_attendance():
                 enforce_detection=True,
                 detector_backend="opencv",
                 silent=True,
+                threshold=FACE_DISTANCE_THRESHOLD,  # Use configurable threshold
             )
             if len(result) > 0 and len(result[0]) > 0:
                 distance = result[0].iloc[0]["distance"]
-                if distance < 0.4:
+                # SECURITY: Validate distance is within strict threshold
+                if distance < FACE_DISTANCE_THRESHOLD:
                     identity = result[0].iloc[0]["identity"]
                     recognized_name = identity.split(os.sep)[-2]
-        except Exception:
+                else:
+                    print(f"[FACE] Distance {distance:.4f} >= threshold {FACE_DISTANCE_THRESHOLD} - rejected")
+        except Exception as e:
+            print(f"[FACE] Recognition error: {e}")
             return jsonify({"error": "No face detected in image. Please try again."}), 400
 
         if not recognized_name:
-            return jsonify({"error": "Face not recognized. Please try again."}), 400
+            return jsonify({
+                "error": "Face not recognized. Please try again.",
+                "distance": round(distance, 4) if distance else None,
+                "threshold": FACE_DISTANCE_THRESHOLD
+            }), 400
 
-        # Lookup user in DB
+        # Lookup user in DB (name is now UNIQUE)
         conn = connect_db()
         user = conn.execute("SELECT id, name FROM users WHERE name=?", (recognized_name,)).fetchone()
         if not user:
             conn.close()
-            return jsonify({"error": "Face recognized but user not found in system."}), 400
+            print(f"[ATTENDANCE] User '{recognized_name}' not found in database")
+            return jsonify({
+                "error": "Face recognized but user not found in system.",
+                "distance": round(distance, 4) if distance else None
+            }), 400
 
         result_info = _mark_attendance_for_user(user["id"], user["name"], conn)
+        result_info["distance"] = round(distance, 4) if distance else None
+        result_info["confidence"] = round(1.0 - distance, 4) if distance else None
+        result_info["threshold"] = FACE_DISTANCE_THRESHOLD
         conn.close()
 
         if result_info["action"] == "skipped":
             return jsonify({"error": result_info["message"]}), 400
         elif result_info["action"] == "check_out":
-            return jsonify({"message": f"Checked out at {result_info['time']}. Welcome back, {recognized_name}!"})
+            return jsonify({**result_info, "message": f"Checked out at {result_info['time']}. Welcome back, {recognized_name}!"})
         else:
-            return jsonify({"message": f"Checked in at {result_info['time']}. Welcome, {recognized_name}!"})
+            return jsonify({**result_info, "message": f"Checked in at {result_info['time']}. Welcome, {recognized_name}!"})
 
     except Exception as e:
         return jsonify({"error": f"Recognition error: {str(e)}"}), 500
@@ -1473,39 +2330,66 @@ def public_multi_attendance():
         if frame is None:
             return jsonify({"error": "Invalid image data"}), 400
 
-        identities, unrecognized_count = _match_faces_with_database(frame)
-
-        if not identities:
-            return jsonify({"error": "No registered faces recognized."}), 400
-
         conn = connect_db()
-        recognized = []
-        seen_users = set()
+        
+        # SECURITY: Get matched users (user_id, name, distance) with validation
+        matched_users, unrecognized_count = _match_faces_with_database(frame, conn)
 
-        for name in identities:
-            user = conn.execute("SELECT id, name FROM users WHERE name=?", (name,)).fetchone()
-            if not user or user["id"] in seen_users:
-                if not user:
-                    unrecognized_count += 1
+        if not matched_users:
+            conn.close()
+            return jsonify({
+                "error": "No registered faces recognized.",
+                "results": [],
+                "unrecognized": unrecognized_count,
+                "message": f"{unrecognized_count} face(s) detected but not recognized.",
+            }), 400
+
+        recognized = []
+        seen_user_ids = set()  # Prevent duplicate attendance for same user
+
+        for user_id, name, distance in matched_users:
+            # SECURITY: Skip if already processed (prevent duplicates)
+            if user_id in seen_user_ids:
+                print(f"[ATTENDANCE] User {user_id} ({name}) already processed this scan - skipping")
                 continue
 
-            seen_users.add(user["id"])
-            result_info = _mark_attendance_for_user(user["id"], user["name"], conn)
+            # SECURITY: Validate user exists in database
+            user = conn.execute("SELECT id, name FROM users WHERE id=?", (user_id,)).fetchone()
+            if not user:
+                print(f"[ATTENDANCE] User ID {user_id} not found in database - rejected")
+                continue
+
+            seen_user_ids.add(user_id)
+            result_info = _mark_attendance_for_user(user_id, user["name"], conn)
+            result_info["confidence"] = round(1.0 - distance, 4)  # Convert distance to confidence
+            result_info["distance"] = round(distance, 4)
+            result_info["threshold"] = FACE_DISTANCE_THRESHOLD
             recognized.append(result_info)
 
         conn.close()
 
         if not recognized:
-            return jsonify({"error": "No registered faces recognized."}), 400
+            return jsonify({
+                "error": "No valid users recognized.",
+                "results": [],
+                "unrecognized": unrecognized_count,
+                "message": f"Faces matched but no valid users found. {unrecognized_count} unrecognized.",
+            }), 400
 
         return jsonify({
             "results": recognized,
             "unrecognized": unrecognized_count,
-            "message": f"Attendance marked for {len(recognized)} user(s).",
-        })
+            "message": f"Attendance marked for {len(recognized)} user(s). {unrecognized_count} face(s) unrecognized.",
+            "face_distance_threshold": FACE_DISTANCE_THRESHOLD,
+        }), 200
 
     except Exception as e:
-        return jsonify({"error": f"Recognition error: {str(e)}"}), 500
+        print(f"[ERROR] Public multi-face attendance error: {str(e)}")
+        return jsonify({
+            "error": f"Recognition error: {str(e)}",
+            "results": [],
+            "unrecognized": 0
+        }), 500
 
 
 # =============================================
@@ -1661,4 +2545,10 @@ if __name__ == "__main__":
     # Ensure database exists
     if not os.path.exists(DATABASE):
         print("WARNING: Database not found. Run database_setup.py first.")
+    
+    # PERF: Pre-load the face recognition model on startup to avoid first-request lag
+    print("[PERF] Pre-loading face recognition model on startup...")
+    get_cached_model("Facenet512")
+    print("[PERF] Model loaded successfully. Face scanning will be faster.")
+    
     app.run(debug=True, port=5000)

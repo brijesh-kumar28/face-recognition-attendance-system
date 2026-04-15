@@ -275,12 +275,29 @@ export default function Home() {
     if (!videoRef.current || !canvasRef.current) return null;
     const canvas = canvasRef.current;
     const video = videoRef.current;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+    
+    // PERF: Optimize image size for faster transmission and processing
+    const maxWidth = 640;
+    const maxHeight = 480;
+    const videoWidth = video.videoWidth;
+    const videoHeight = video.videoHeight;
+    
+    // Scale down if larger than max dimensions
+    let width = videoWidth;
+    let height = videoHeight;
+    if (width > maxWidth || height > maxHeight) {
+      const ratio = Math.min(maxWidth / width, maxHeight / height);
+      width = Math.round(width * ratio);
+      height = Math.round(height * ratio);
+    }
+    
+    canvas.width = width;
+    canvas.height = height;
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
-    ctx.drawImage(video, 0, 0);
-    return canvas.toDataURL("image/jpeg");
+    ctx.drawImage(video, 0, 0, width, height);
+    // PERF: Use 0.75 quality for faster transmission while maintaining face detection accuracy
+    return canvas.toDataURL("image/jpeg", 0.75);
   };
 
   const captureAndScan = async () => {

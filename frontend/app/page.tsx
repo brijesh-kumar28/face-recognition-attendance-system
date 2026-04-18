@@ -25,7 +25,11 @@ import Link from "next/link";
 import api from "@/lib/axios";
 import axios from "axios";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
+const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000").replace(/\/$/, "");
+if (typeof window !== "undefined") {
+  console.log("[Config] NEXT_PUBLIC_API_URL:", process.env.NEXT_PUBLIC_API_URL ?? "(not set — using localhost fallback)");
+  console.log("[Config] API_BASE resolved to:", API_BASE);
+}
 
 type ScanState = "idle" | "scanning" | "success" | "error";
 type ScanMode = "group" | "single";
@@ -221,19 +225,49 @@ export default function Home() {
 
   const fetchHealthcheck = async () => {
     setHealthStatus("loading");
-    try {
-      const res = await axios.get(`${API_BASE}/api/public/healthcheck`);
-      if (res.data?.status === "ok") {
-        setHealthStatus("ok");
-        setHealthMessage("Service available");
-      } else {
-        setHealthStatus("error");
-        setHealthMessage(res.data?.error || "Unexpected response");
+    const url = `${API_BASE}/health`;
+    console.log("[Health] Checking:", url);
+
+    const attempt = async (): Promise<boolean> => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000); // 8s for Render cold-start
+      try {
+        const res = await fetch(url, {
+          method: "GET",
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        console.log("[Health] Response:", data);
+        return data?.status === "ok";
+      } catch (err) {
+        clearTimeout(timer);
+        throw err;
       }
-    } catch {
-      setHealthStatus("error");
-      setHealthMessage("Backend unavailable");
+    };
+
+    // Retry once to handle Render cold-start spin-up delay
+    for (let i = 0; i < 2; i++) {
+      try {
+        const ok = await attempt();
+        if (ok) {
+          setHealthStatus("ok");
+          setHealthMessage("Service available");
+          return;
+        }
+        setHealthStatus("error");
+        setHealthMessage("Unexpected response");
+        return;
+      } catch (err) {
+        console.warn(`[Health] Attempt ${i + 1} failed:`, err);
+        if (i < 1) await new Promise((r) => setTimeout(r, 3000)); // wait 3s before retry
+      }
     }
+
+    setHealthStatus("error");
+    setHealthMessage("Backend unavailable");
   };
 
   const fetchLatestAttendance = async () => {

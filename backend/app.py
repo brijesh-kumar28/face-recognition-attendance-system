@@ -46,6 +46,7 @@ print(f"[CONFIG] Rate limiting enabled")
 # ============ CORS: Configurable origins from environment ============
 _cors_env = os.getenv("CORS_ORIGINS", "").strip()
 _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else [
+    "https://face-recognition-attendance-system-theta.vercel.app",
     "http://localhost:3000",
     "http://localhost:3001",
     "http://localhost:3002",
@@ -2502,3 +2503,10 @@ if __name__ == "__main__":
     print("[PERF] Model loaded successfully. Face scanning will be faster.")
     
     app.run(debug=os.getenv("FLASK_DEBUG", "false").lower() == "true", port=5000)
+    
+    @app.route("/")
+    def home():
+     return {
+        "message": "Face Attendance API is running 🚀",
+        "status": "ok"
+    }, 200

@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, g
-from flask_cors import CORS
+from flask_cors import CORS  # kept for optional use; manual headers take precedence
 from flask_limiter import Limiter
+import re
 from flask_limiter.util import get_remote_address
 from deepface import DeepFace
 import cv2
@@ -44,22 +45,33 @@ limiter = Limiter(
 )
 print(f"[CONFIG] Rate limiting enabled")
 
-# ============ CORS: Configurable origins from environment ============
-_cors_env = os.getenv("CORS_ORIGINS", "").strip()
-_cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else [
-    "https://face-recognition-attendance-system-theta.vercel.app",
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://localhost:3002",
-]
-CORS(
-    app,
-    supports_credentials=True,
-    origins=_cors_origins,
-    allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+# ============ CORS: Pattern-based origin matching ============
+# 🔧 FIXED: Use pattern matching so Vercel preview URLs (which change per deploy)
+#           are allowed without hardcoding every possible subdomain.
+#
+# Exact origins from env var (optional, comma-separated) take precedence.
+# If env var is absent, only the two default patterns below are used.
+_cors_exact: list[str] = (
+    [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 )
-print(f"[CONFIG] CORS origins: {_cors_origins}")
+
+# ✅ ADDED: Compiled patterns that match any Vercel deployment + localhost
+_CORS_PATTERNS: list[re.Pattern] = [
+    re.compile(r'^https://[\w-]+\.vercel\.app$'),   # any *.vercel.app origin
+    re.compile(r'^http://localhost:\d+$'),            # localhost on any port
+]
+
+def _is_allowed_origin(origin: str) -> bool:
+    """Return True if the request Origin is permitted to access this API."""
+    if not origin:
+        return False
+    # 1. Explicit list from CORS_ORIGINS env var (highest priority)
+    if origin in _cors_exact:
+        return True
+    # 2. Pattern-based: any Vercel URL or localhost
+    return any(p.match(origin) for p in _CORS_PATTERNS)
+
+print(f"[CONFIG] CORS: exact overrides={_cors_exact or 'none'}, patterns=vercel.app+localhost")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE = os.path.join(BASE_DIR, "attendance.db")
@@ -76,28 +88,27 @@ print(f"[CONFIG] Face distance threshold set to {FACE_DISTANCE_THRESHOLD}")
 # ============ SECURITY HEADERS: Production Hardening ============
 @app.after_request
 def set_security_headers(response):
-    """Add security headers and dynamic CORS headers to all responses."""
-    # Prevent clickjacking attacks
+    """Add security and CORS headers to every response."""
+    # Security headers
     response.headers["X-Frame-Options"] = "DENY"
-    # Prevent MIME type sniffing
     response.headers["X-Content-Type-Options"] = "nosniff"
-    # Basic CSP - can be customized
-    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
-    # Prevent browser caching sensitive data
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+    )
     response.headers["Cache-Control"] = "no-store, max-age=0"
     response.headers["Pragma"] = "no-cache"
 
-    # ✅ ADDED: Dynamic CORS headers — must NOT use wildcard with credentials
+    # 🔧 FIXED: Echo back the request Origin when it is in the allow-list.
+    #  - Never use "*" with credentials=true (browsers reject it).
+    #  - Never fall back to a different origin — that causes the exact mismatch
+    #    the browser reports ("expected X but got Y").
     origin = request.headers.get("Origin", "")
-    if origin in _cors_origins:
+    if _is_allowed_origin(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
-    else:
-        # Fallback to primary Vercel origin for unlisted origins
-        response.headers["Access-Control-Allow-Origin"] = _cors_origins[0]
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
 
     return response
 

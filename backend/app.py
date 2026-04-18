@@ -76,7 +76,7 @@ print(f"[CONFIG] Face distance threshold set to {FACE_DISTANCE_THRESHOLD}")
 # ============ SECURITY HEADERS: Production Hardening ============
 @app.after_request
 def set_security_headers(response):
-    """Add security headers to all responses."""
+    """Add security headers and dynamic CORS headers to all responses."""
     # Prevent clickjacking attacks
     response.headers["X-Frame-Options"] = "DENY"
     # Prevent MIME type sniffing
@@ -86,6 +86,19 @@ def set_security_headers(response):
     # Prevent browser caching sensitive data
     response.headers["Cache-Control"] = "no-store, max-age=0"
     response.headers["Pragma"] = "no-cache"
+
+    # ✅ ADDED: Dynamic CORS headers — must NOT use wildcard with credentials
+    origin = request.headers.get("Origin", "")
+    if origin in _cors_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    else:
+        # Fallback to primary Vercel origin for unlisted origins
+        response.headers["Access-Control-Allow-Origin"] = _cors_origins[0]
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Vary"] = "Origin"
+
     return response
 
 
@@ -812,8 +825,20 @@ def _mark_attendance_for_user(user_id, user_name, conn):
 #              HEALTH ENDPOINT
 # =============================================
 
-@app.route("/health", methods=["GET"])
+# ✅ ADDED: Global OPTIONS preflight handler — handles all routes
+@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def handle_options(path):
+    """Return 200 for all CORS preflight (OPTIONS) requests."""
+    response = jsonify({"status": "ok"})
+    response.status_code = 200
+    return response
+
+# 🔧 MODIFIED: Added OPTIONS to allowed methods so preflight on /health works
+@app.route("/health", methods=["GET", "OPTIONS"])
 def health():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
     return jsonify({"status": "ok", "message": "Backend is healthy"}), 200
 
 # =============================================

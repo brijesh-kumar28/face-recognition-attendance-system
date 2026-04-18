@@ -25,7 +25,18 @@ import Link from "next/link";
 import api from "@/lib/axios";
 import axios from "axios";
 
-const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000").replace(/\/$/, "");
+// const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000").replace(/\/$/, "");
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "");
+
+if (!API_BASE) {
+  throw new Error("NEXT_PUBLIC_API_URL is not set in Vercel");
+}
+
+if (typeof window !== "undefined") {
+  console.log("[Config] API_BASE:", API_BASE);
+}
+
 if (typeof window !== "undefined") {
   console.log("[Config] NEXT_PUBLIC_API_URL:", process.env.NEXT_PUBLIC_API_URL ?? "(not set — using localhost fallback)");
   console.log("[Config] API_BASE resolved to:", API_BASE);

@@ -22,6 +22,7 @@ import {
   X,
 } from "lucide-react";
 import Link from "next/link";
+import api from "@/lib/axios";
 import axios from "axios";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
@@ -74,7 +75,7 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
 
 export default function Home() {
   const [scanState, setScanState] = useState<ScanState>("idle");
-  const [scanMode, setScanMode] = useState<ScanMode>("group");
+  const scanMode: ScanMode = "group";
   const [autoScanEnabled, setAutoScanEnabled] = useState(false);
   const [resultMessage, setResultMessage] = useState("");
   const [groupResults, setGroupResults] = useState<GroupResult[]>([]);
@@ -91,6 +92,7 @@ export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef<number>(0);
+  const captureAndScanRef = useRef<() => void>(() => {});
   const { toast } = useToast();
 
   // Set srcObject after the <video> element mounts (state update is async)
@@ -228,7 +230,7 @@ export default function Home() {
         setHealthStatus("error");
         setHealthMessage(res.data?.error || "Unexpected response");
       }
-    } catch (err) {
+    } catch {
       setHealthStatus("error");
       setHealthMessage("Backend unavailable");
     }
@@ -265,7 +267,7 @@ export default function Home() {
     if (facesInFrame === 0) return;
 
     const timer = window.setTimeout(() => {
-      captureAndScan();
+      captureAndScanRef.current();
     }, 1200);
 
     return () => window.clearTimeout(timer);
@@ -312,7 +314,7 @@ export default function Home() {
 
     try {
       if (scanMode === "group") {
-        const res = await axios.post<GroupResponse>(`${API_BASE}/api/public/multi-attendance`, {
+        const res = await api.post<GroupResponse>("/api/multi-attendance", {
           image: imageData,
         });
         const { results, unrecognized, message } = res.data;
@@ -323,7 +325,7 @@ export default function Home() {
         setShowModal(true);
         stopCamera();
       } else {
-        const res = await axios.post<SingleResponse>(`${API_BASE}/api/public/mark-attendance`, {
+        const res = await api.post<SingleResponse>("/api/user/mark-attendance", {
           image: imageData,
         });
         setScanState("success");
@@ -343,6 +345,8 @@ export default function Home() {
       toast({ title: "Recognition Failed", description: msg, variant: "destructive" });
     }
   };
+
+  captureAndScanRef.current = captureAndScan;
 
   const liveHint =
     scanMode === "group"
@@ -550,7 +554,7 @@ export default function Home() {
               </Badge>
             </div>
             <p className="text-xs text-muted-foreground mb-2">{healthMessage || "Public endpoints available"}</p>
-            <Button size="xs" className="w-full" onClick={fetchHealthcheck}>
+            <Button size="sm" className="w-full" onClick={fetchHealthcheck}>
               Refresh Health
             </Button>
           </div>
@@ -558,7 +562,7 @@ export default function Home() {
           <div className="rounded-xl border bg-background p-3 shadow-sm mt-3">
             <div className="flex items-center justify-between mb-2">
               <p className="text-xs font-semibold">Latest Attendance</p>
-              <Button variant="outline" size="xs" onClick={fetchLatestAttendance}>
+              <Button variant="outline" size="sm" onClick={fetchLatestAttendance}>
                 Refresh
               </Button>
             </div>

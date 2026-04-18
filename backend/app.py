@@ -43,13 +43,21 @@ limiter = Limiter(
 )
 print(f"[CONFIG] Rate limiting enabled")
 
+# ============ CORS: Configurable origins from environment ============
+_cors_env = os.getenv("CORS_ORIGINS", "").strip()
+_cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:3002",
+]
 CORS(
     app,
     supports_credentials=True,
-    origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002"],
+    origins=_cors_origins,
     allow_headers=["Content-Type", "Authorization"],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
+print(f"[CONFIG] CORS origins: {_cors_origins}")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE = os.path.join(BASE_DIR, "attendance.db")
@@ -1123,9 +1131,11 @@ def admin_delete_user(user_id):
         return jsonify(response)
 
     except sqlite3.Error as e:
-        return jsonify({"error": f"Database delete failed: {str(e)}"}), 500
+        print(f"[ERROR] Database delete failed: {e}")
+        return jsonify({"error": "Internal server error"}), 500
     except Exception as e:
-        return jsonify({"error": f"Delete failed: {str(e)}"}), 500
+        print(f"[ERROR] Delete failed: {e}")
+        return jsonify({"error": "Internal server error"}), 500
     finally:
         conn.close()
 
@@ -1205,16 +1215,29 @@ def admin_register_user():
 def admin_update_user(user_id):
     """Admin updates user details and optional password reset."""
     data = request.json or {}
-    name = (data.get("name") or "").strip()
-    email = (data.get("email") or "").strip().lower()
-    department = (data.get("department") or "").strip()
+    name = sanitize_input((data.get("name") or "").strip())
+    email = sanitize_input((data.get("email") or "").strip().lower())
+    department = sanitize_input((data.get("department") or "").strip(), max_length=100)
     new_password = data.get("password") or ""
 
     if not name or not email:
         return jsonify({"error": "Name and email are required"}), 400
 
-    if new_password and len(new_password) < 6:
-        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    # Validate username format
+    if not validate_username(name):
+        return jsonify({"error": "Name must be 2-100 characters and contain only letters, numbers, spaces, or hyphens"}), 400
+
+    # Validate email format
+    if not validate_email(email):
+        return jsonify({"error": "Invalid email format"}), 400
+
+    # Validate password complexity if provided
+    if new_password:
+        if len(new_password) < 6:
+            return jsonify({"error": "Password must be at least 6 characters"}), 400
+        import re
+        if not re.search(r'[A-Z]', new_password) or not re.search(r'[a-z]', new_password) or not re.search(r'\d', new_password):
+            return jsonify({"error": "Password must contain uppercase, lowercase, and numbers"}), 400
 
     conn = connect_db()
     dataset_warning = None
@@ -1231,7 +1254,16 @@ def admin_update_user(user_id):
         if existing:
             return jsonify({"error": "Email already registered by another user"}), 400
 
+        # Name uniqueness check (case-insensitive)
         old_name = user["name"]
+        if name != old_name:
+            existing_name = conn.execute(
+                "SELECT id FROM users WHERE LOWER(name)=LOWER(?) AND id<>?",
+                (name, user_id),
+            ).fetchone()
+            if existing_name:
+                conn.close()
+                return jsonify({"error": "Username already taken"}), 400
 
         conn.execute(
             "UPDATE users SET name=?, email=?, department=? WHERE id=?",
@@ -1248,21 +1280,27 @@ def admin_update_user(user_id):
 
         # Rename (or merge) dataset folder when user name changes.
         if name != old_name:
-            old_path = os.path.join(DATASET_PATH, old_name)
-            new_path = os.path.join(DATASET_PATH, name)
-            try:
-                if os.path.exists(old_path):
-                    if not os.path.exists(new_path):
-                        os.rename(old_path, new_path)
-                    else:
-                        for fname in os.listdir(old_path):
-                            src = os.path.join(old_path, fname)
-                            dst = os.path.join(new_path, fname)
-                            if os.path.isfile(src) and not os.path.exists(dst):
-                                shutil.move(src, dst)
-                        shutil.rmtree(old_path, ignore_errors=True)
-            except Exception as e:
-                dataset_warning = f"Dataset folder rename skipped: {str(e)}"
+            old_path = os.path.normpath(os.path.join(DATASET_PATH, old_name))
+            new_path = os.path.normpath(os.path.join(DATASET_PATH, name))
+            # SECURITY: Path traversal protection
+            if not old_path.startswith(os.path.normpath(DATASET_PATH)) or \
+               not new_path.startswith(os.path.normpath(DATASET_PATH)):
+                dataset_warning = "Dataset folder rename skipped: invalid path"
+            else:
+                try:
+                    if os.path.exists(old_path):
+                        if not os.path.exists(new_path):
+                            os.rename(old_path, new_path)
+                        else:
+                            for fname in os.listdir(old_path):
+                                src = os.path.join(old_path, fname)
+                                dst = os.path.join(new_path, fname)
+                                if os.path.isfile(src) and not os.path.exists(dst):
+                                    shutil.move(src, dst)
+                            shutil.rmtree(old_path, ignore_errors=True)
+                except Exception as e:
+                    print(f"[ERROR] Dataset folder rename failed: {e}")
+                    dataset_warning = "Dataset folder rename skipped"
 
         updated = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         response = {
@@ -1279,9 +1317,11 @@ def admin_update_user(user_id):
         return jsonify(response)
 
     except sqlite3.Error as e:
-        return jsonify({"error": f"Database update failed: {str(e)}"}), 500
+        print(f"[ERROR] Database update failed: {e}")
+        return jsonify({"error": "Internal server error"}), 500
     except Exception as e:
-        return jsonify({"error": f"Update failed: {str(e)}"}), 500
+        print(f"[ERROR] Update failed: {e}")
+        return jsonify({"error": "Internal server error"}), 500
     finally:
         conn.close()
 
@@ -1435,11 +1475,13 @@ def admin_upload_training_images():
 @admin_required
 def admin_capture_training_images():
     """Save camera-captured base64 images for a username into dataset folder."""
+    MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB per image
+
     conn = connect_db()
 
     try:
         data = request.json or {}
-        username = (data.get("username") or "").strip()
+        username = sanitize_input((data.get("username") or "").strip())
         images = data.get("images") or []
         replace_existing = bool(data.get("replace", True))
 
@@ -1464,7 +1506,11 @@ def admin_capture_training_images():
             conn.close()
             return jsonify({"error": "User not found for provided username"}), 404
 
-        user_folder = os.path.join(DATASET_PATH, user["name"])
+        # SECURITY: Path traversal protection on user folder
+        user_folder = os.path.normpath(os.path.join(DATASET_PATH, user["name"]))
+        if not user_folder.startswith(os.path.normpath(DATASET_PATH)):
+            conn.close()
+            return jsonify({"error": "Invalid user path"}), 400
         os.makedirs(user_folder, exist_ok=True)
 
         if replace_existing:
@@ -1475,45 +1521,80 @@ def admin_capture_training_images():
                     except OSError:
                         pass
 
-        import time
         saved_count = 0
+        errors = []
 
         for idx, img_data in enumerate(images):
+            if idx >= 60:  # Safety cap
+                break
+
+            # 1. Validate input type and format
             if not isinstance(img_data, str) or "," not in img_data:
+                errors.append(f"Image {idx}: invalid format")
                 continue
 
+            encoded = img_data.split(",", 1)[1]
+            if not encoded:
+                errors.append(f"Image {idx}: empty payload")
+                continue
+
+            # 2. Decode base64 safely
             try:
-                encoded = img_data.split(",", 1)[1]
-                img_bytes = base64.b64decode(encoded)
-                np_arr = np.frombuffer(img_bytes, np.uint8)
-                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                if frame is None:
-                    continue
-
-                filename = f"capture_{int(time.time() * 1000)}_{idx}.jpg"
-                filepath = os.path.join(user_folder, filename)
-                if cv2.imwrite(filepath, frame):
-                    saved_count += 1
+                img_bytes = base64.b64decode(encoded, validate=True)
             except Exception:
+                errors.append(f"Image {idx}: invalid base64")
                 continue
+
+            # 3. Enforce size limit before any processing
+            if len(img_bytes) > MAX_IMAGE_SIZE:
+                errors.append(f"Image {idx}: exceeds 5MB limit")
+                continue
+
+            if len(img_bytes) == 0:
+                errors.append(f"Image {idx}: empty after decode")
+                continue
+
+            # 4. Verify it decodes to a real image via OpenCV
+            np_arr = np.frombuffer(img_bytes, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if frame is None or frame.size == 0:
+                errors.append(f"Image {idx}: not a valid image")
+                continue
+
+            # 5. Generate safe UUID filename (never trust client input)
+            filename = generate_safe_filename("capture.jpg")
+
+            # 6. Build filepath with path traversal check
+            filepath = os.path.normpath(os.path.join(user_folder, filename))
+            if not filepath.startswith(os.path.normpath(user_folder)):
+                errors.append(f"Image {idx}: path traversal blocked")
+                continue
+
+            # 7. Write only if all checks passed
+            if cv2.imwrite(filepath, frame):
+                saved_count += 1
+            else:
+                errors.append(f"Image {idx}: write failed")
 
         if saved_count == 0:
             conn.close()
             return jsonify({"error": "No valid images were captured"}), 400
 
         conn.close()
-        return jsonify(
-            {
-                "message": f"Saved {saved_count} captured image(s) for {user['name']}",
-                "count": saved_count,
-                "userId": str(user["id"]),
-                "username": user["name"],
-            }
-        ), 200
+        response = {
+            "message": f"Saved {saved_count} captured image(s) for {user['name']}",
+            "count": saved_count,
+            "userId": str(user["id"]),
+            "username": user["name"],
+        }
+        if errors:
+            response["warnings"] = errors
+        return jsonify(response), 200
 
     except Exception as e:
+        print(f"[ERROR] Capture training images failed: {e}")
         conn.close()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
 
 
 @app.route("/api/admin/train", methods=["POST"])
@@ -1587,8 +1668,9 @@ def admin_train_model():
         })
 
     except Exception as e:
+        print(f"[ERROR] Training failed: {e}")
         conn.close()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
 
 
 @app.route("/api/admin/attendance", methods=["GET"])
@@ -1932,7 +2014,8 @@ def user_mark_attendance():
             return jsonify({**result_info, "message": f"Checked in at {result_info['time']}. Recognized as {recognized_name}."})
 
     except Exception as e:
-        return jsonify({"error": f"Recognition error: {str(e)}"}), 500
+        print(f"[ERROR] Recognition error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
 
 # =============================================
@@ -2084,9 +2167,9 @@ def multi_face_attendance():
         return jsonify(success_response), 200
 
     except Exception as e:
-        print(f"[ERROR] Multi-face attendance error: {str(e)}")
+        print(f"[ERROR] Multi-face attendance error: {e}")
         error_response = {
-            "error": f"Recognition error: {str(e)}",
+            "error": "Internal server error",
             "results": [],
             "unrecognized": 0
         }
@@ -2168,11 +2251,21 @@ def update_user_profile():
     if request.content_type and "multipart" in request.content_type:
         file = request.files.get("image")
         if file:
-            # Save profile image
+            # SECURITY: Validate uploaded file (type, size, MIME)
+            is_valid, error_msg = validate_file_upload(file, max_size_mb=5)
+            if not is_valid:
+                conn.close()
+                return jsonify({"error": error_msg}), 400
+
             uploads_dir = os.path.join("static", "uploads")
             os.makedirs(uploads_dir, exist_ok=True)
-            filename = f"profile_{user_id}_{int(datetime.now().timestamp())}.jpg"
+            # SECURITY: Use UUID-based safe filename
+            filename = generate_safe_filename(file.filename)
             filepath = os.path.join(uploads_dir, filename)
+            filepath = os.path.normpath(filepath)
+            if not filepath.startswith(os.path.normpath(uploads_dir)):
+                conn.close()
+                return jsonify({"error": "Invalid file path"}), 400
             file.save(filepath)
             image_url = f"/static/uploads/{filename}"
             conn.execute("UPDATE users SET profile_image=? WHERE id=?", (image_url, user_id))
@@ -2185,7 +2278,7 @@ def update_user_profile():
     # Password change
     if data.get("newPassword"):
         current_pw = data.get("currentPassword", "")
-        if g.current_user["password_hash"] != hash_password(current_pw):
+        if not verify_password(current_pw, g.current_user["password_hash"]):
             conn.close()
             return jsonify({"error": "Current password is incorrect"}), 400
         conn.execute(
@@ -2194,13 +2287,30 @@ def update_user_profile():
         )
         conn.commit()
         conn.close()
+        # PERF: Invalidate user cache after password change
+        invalidate_user_cache(user_id)
         return jsonify({"message": "Password updated"})
 
     # Profile update
-    name = data.get("name", g.current_user["name"])
-    department = data.get("department", g.current_user["department"])
+    name = sanitize_input(data.get("name", g.current_user["name"]))
+    department = sanitize_input(data.get("department", g.current_user["department"]), max_length=100)
+
+    if not name or len(name) < 2:
+        conn.close()
+        return jsonify({"error": "Name must be at least 2 characters"}), 400
 
     old_name = g.current_user["name"]
+
+    # SECURITY: Check name uniqueness before update
+    if name != old_name:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE LOWER(name)=LOWER(?) AND id<>?",
+            (name, user_id),
+        ).fetchone()
+        if existing:
+            conn.close()
+            return jsonify({"error": "Username already taken"}), 400
+
     conn.execute(
         "UPDATE users SET name=?, department=? WHERE id=?",
         (name, department, user_id),
@@ -2208,188 +2318,19 @@ def update_user_profile():
     conn.commit()
     conn.close()
 
-    # Rename dataset folder if name changed
+    # PERF: Invalidate user cache after profile change
+    invalidate_user_cache(user_id)
+
+    # Rename dataset folder if name changed (with path traversal check)
     if name != old_name:
-        old_path = os.path.join(DATASET_PATH, old_name)
-        new_path = os.path.join(DATASET_PATH, name)
-        if os.path.exists(old_path):
+        old_path = os.path.normpath(os.path.join(DATASET_PATH, old_name))
+        new_path = os.path.normpath(os.path.join(DATASET_PATH, name))
+        if old_path.startswith(os.path.normpath(DATASET_PATH)) and \
+           new_path.startswith(os.path.normpath(DATASET_PATH)) and \
+           os.path.exists(old_path):
             os.rename(old_path, new_path)
 
     return jsonify({"message": "Profile updated"})
-
-
-# =============================================
-#        LEGACY ENDPOINTS (backward compat)
-# =============================================
-
-# =============================================
-#        PUBLIC ATTENDANCE (NO AUTH)
-# =============================================
-
-@app.route("/api/public/mark-attendance", methods=["POST"])
-def public_mark_attendance():
-    """Public endpoint: recognise a single face and mark attendance (no login required)."""
-    data = request.json
-    image_data = data.get("image", "")
-
-    if not image_data:
-        return jsonify({"error": "No image provided"}), 400
-
-    try:
-        if "," in image_data:
-            image_data = image_data.split(",")[1]
-
-        img_bytes = base64.b64decode(image_data)
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if frame is None:
-            return jsonify({"error": "Invalid image data"}), 400
-
-        recognized_name = None
-        distance = None
-        try:
-            result = DeepFace.find(
-                img_path=frame,
-                db_path=DATASET_PATH,
-                enforce_detection=True,
-                detector_backend="opencv",
-                silent=True,
-                threshold=FACE_DISTANCE_THRESHOLD,  # Use configurable threshold
-            )
-            if len(result) > 0 and len(result[0]) > 0:
-                distance = result[0].iloc[0]["distance"]
-                # SECURITY: Validate distance is within strict threshold
-                if distance < FACE_DISTANCE_THRESHOLD:
-                    identity = result[0].iloc[0]["identity"]
-                    recognized_name = identity.split(os.sep)[-2]
-                else:
-                    print(f"[FACE] Distance {distance:.4f} >= threshold {FACE_DISTANCE_THRESHOLD} - rejected")
-        except Exception as e:
-            print(f"[FACE] Recognition error: {e}")
-            return jsonify({"error": "No face detected in image. Please try again."}), 400
-
-        if not recognized_name:
-            return jsonify({
-                "error": "Face not recognized. Please try again.",
-                "distance": round(distance, 4) if distance else None,
-                "threshold": FACE_DISTANCE_THRESHOLD
-            }), 400
-
-        # Lookup user in DB (name is now UNIQUE)
-        conn = connect_db()
-        user = conn.execute("SELECT id, name FROM users WHERE name=?", (recognized_name,)).fetchone()
-        if not user:
-            conn.close()
-            print(f"[ATTENDANCE] User '{recognized_name}' not found in database")
-            return jsonify({
-                "error": "Face recognized but user not found in system.",
-                "distance": round(distance, 4) if distance else None
-            }), 400
-
-        result_info = _mark_attendance_for_user(user["id"], user["name"], conn)
-        result_info["distance"] = round(distance, 4) if distance else None
-        result_info["confidence"] = round(1.0 - distance, 4) if distance else None
-        result_info["threshold"] = FACE_DISTANCE_THRESHOLD
-        conn.close()
-
-        if result_info["action"] == "skipped":
-            return jsonify({"error": result_info["message"]}), 400
-        elif result_info["action"] == "check_out":
-            return jsonify({**result_info, "message": f"Checked out at {result_info['time']}. Welcome back, {recognized_name}!"})
-        else:
-            return jsonify({**result_info, "message": f"Checked in at {result_info['time']}. Welcome, {recognized_name}!"})
-
-    except Exception as e:
-        return jsonify({"error": f"Recognition error: {str(e)}"}), 500
-
-
-@app.route("/api/public/multi-attendance", methods=["POST"])
-def public_multi_attendance():
-    """Public endpoint: detect ALL faces in a single image and mark attendance (no login required)."""
-    data = request.json
-    image_data = data.get("image", "")
-
-    if not image_data:
-        return jsonify({"error": "No image provided"}), 400
-
-    try:
-        if "," in image_data:
-            image_data = image_data.split(",", 1)[1].strip()
-
-        if not image_data:
-            return jsonify({"error": "Empty image payload"}), 400
-
-        img_bytes = base64.b64decode(image_data, validate=True)
-        if not img_bytes:
-            return jsonify({"error": "Invalid image payload"}), 400
-
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if frame is None:
-            return jsonify({"error": "Invalid image data"}), 400
-
-        conn = connect_db()
-        
-        # SECURITY: Get matched users (user_id, name, distance) with validation
-        matched_users, unrecognized_count = _match_faces_with_database(frame, conn)
-
-        if not matched_users:
-            conn.close()
-            return jsonify({
-                "error": "No registered faces recognized.",
-                "results": [],
-                "unrecognized": unrecognized_count,
-                "message": f"{unrecognized_count} face(s) detected but not recognized.",
-            }), 400
-
-        recognized = []
-        seen_user_ids = set()  # Prevent duplicate attendance for same user
-
-        for user_id, name, distance in matched_users:
-            # SECURITY: Skip if already processed (prevent duplicates)
-            if user_id in seen_user_ids:
-                print(f"[ATTENDANCE] User {user_id} ({name}) already processed this scan - skipping")
-                continue
-
-            # SECURITY: Validate user exists in database
-            user = conn.execute("SELECT id, name FROM users WHERE id=?", (user_id,)).fetchone()
-            if not user:
-                print(f"[ATTENDANCE] User ID {user_id} not found in database - rejected")
-                continue
-
-            seen_user_ids.add(user_id)
-            result_info = _mark_attendance_for_user(user_id, user["name"], conn)
-            result_info["confidence"] = round(1.0 - distance, 4)  # Convert distance to confidence
-            result_info["distance"] = round(distance, 4)
-            result_info["threshold"] = FACE_DISTANCE_THRESHOLD
-            recognized.append(result_info)
-
-        conn.close()
-
-        if not recognized:
-            return jsonify({
-                "error": "No valid users recognized.",
-                "results": [],
-                "unrecognized": unrecognized_count,
-                "message": f"Faces matched but no valid users found. {unrecognized_count} unrecognized.",
-            }), 400
-
-        return jsonify({
-            "results": recognized,
-            "unrecognized": unrecognized_count,
-            "message": f"Attendance marked for {len(recognized)} user(s). {unrecognized_count} face(s) unrecognized.",
-            "face_distance_threshold": FACE_DISTANCE_THRESHOLD,
-        }), 200
-
-    except Exception as e:
-        print(f"[ERROR] Public multi-face attendance error: {str(e)}")
-        return jsonify({
-            "error": f"Recognition error: {str(e)}",
-            "results": [],
-            "unrecognized": 0
-        }), 500
 
 
 # =============================================
@@ -2409,7 +2350,8 @@ def public_healthcheck():
             "version": "1.0.0",
         })
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        print(f"[ERROR] Healthcheck failed: {e}")
+        return jsonify({"status": "error", "error": "Service unavailable"}), 500
 
 
 @app.route("/api/public/latest-attendance", methods=["GET"])
@@ -2551,4 +2493,4 @@ if __name__ == "__main__":
     get_cached_model("Facenet512")
     print("[PERF] Model loaded successfully. Face scanning will be faster.")
     
-    app.run(debug=True, port=5000)
+    app.run(debug=os.getenv("FLASK_DEBUG", "false").lower() == "true", port=5000)

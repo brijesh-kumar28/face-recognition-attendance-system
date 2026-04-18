@@ -35,7 +35,7 @@ export default function AdminAttendancePage() {
         params.department = departmentFilter;
 
       const res = await api.get("/api/admin/attendance", { params });
-      setRecords(res.data);
+      setRecords(res.data.items ?? res.data);
     } catch {
       toast({
         title: "Error",

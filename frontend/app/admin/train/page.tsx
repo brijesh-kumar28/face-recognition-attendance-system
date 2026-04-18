@@ -56,7 +56,7 @@ export default function TrainModelPage() {
     try {
       setIsLoading(true);
       const res = await api.get("/api/admin/untrained-users");
-      setUsers(res.data);
+      setUsers(res.data.items ?? res.data);
     } catch {
       toast({
         title: "Error",

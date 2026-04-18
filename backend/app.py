@@ -23,6 +23,7 @@ import hashlib
 
 app = Flask(__name__)
 
+
 # ============ JWT SECURITY: Load from environment ============
 JWT_SECRET = os.getenv("JWT_SECRET")
 if not JWT_SECRET:
@@ -2504,9 +2505,10 @@ if __name__ == "__main__":
     
     app.run(debug=os.getenv("FLASK_DEBUG", "false").lower() == "true", port=5000)
     
-    @app.route("/")
-    def home():
-     return {
+ 
+    @app.route("/", methods=["GET"])
+    def root():
+      return {
         "message": "Face Attendance API is running 🚀",
         "status": "ok"
     }, 200

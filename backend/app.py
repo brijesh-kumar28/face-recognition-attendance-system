@@ -807,6 +807,14 @@ def _mark_attendance_for_user(user_id, user_name, conn):
     ensure_password_reset_table()
 
 # =============================================
+#              HEALTH ENDPOINT
+# =============================================
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "message": "Backend is healthy"}), 200
+
+# =============================================
 #              AUTH ENDPOINTS
 # =============================================
 
@@ -2494,10 +2502,3 @@ if __name__ == "__main__":
     print("[PERF] Model loaded successfully. Face scanning will be faster.")
     
     app.run(debug=os.getenv("FLASK_DEBUG", "false").lower() == "true", port=5000)
-
-@app.route("/health")
-def health():
-    return {
-        "status": "ok",
-        "message": "Backend is healthy"
-    }
